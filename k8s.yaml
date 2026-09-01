@@ -9,6 +9,17 @@ stringData:
   POSTGRES_PASSWORD: demo
   POSTGRES_DB: demodb
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,6 +42,14 @@ spec:
                 name: postgres-secret
           ports:
             - containerPort: 5432
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -43,7 +62,6 @@ spec:
     - port: 5432
       targetPort: 5432
 ---
-# --- Spring Boot app ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
