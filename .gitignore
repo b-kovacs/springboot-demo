@@ -1,0 +1,4 @@
+target/
+demo-app.tar
+.vscode/settings.json
+*.class
