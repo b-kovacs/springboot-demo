@@ -98,3 +98,4 @@ java -jar target/demo-0.0.1-SNAPSHOT.jar
 ```
 
 <!-- race-condition-fix verification commit -->
+<!-- second race-guard verification commit -->
