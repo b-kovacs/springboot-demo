@@ -4,12 +4,13 @@ A small internal announcements service, built with Spring Boot and JPA. Teams po
 announcements ("office closed Monday", "new deploy process starts next sprint") and anyone
 can read them through a REST API, instead of announcements getting lost in chat.
 
-This is the application half of a larger project. The infrastructure half,
+This is one half of a two-repo project. The other half,
 [flux-infra](https://github.com/b-kovacs/flux-infra), is a full Kubernetes platform
 managed with GitOps. It builds this app through an automated pipeline, deploys it,
-secures it, and monitors it. If you're evaluating the platform work, read that repo's
-README first. This one is intentionally the smaller half: the app is simple on purpose so
-it doesn't distract from the infrastructure it lives in.
+secures it, and monitors it. Both halves matter equally to the project, but the app is
+deliberately kept small: the goal was to learn as much as possible about the platform
+side, so the app just needed to be real enough to build, test, deploy, and monitor
+properly, not to carry a lot of business logic of its own.
 
 ## A quick note on the Spring Boot version
 
