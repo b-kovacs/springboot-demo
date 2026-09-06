@@ -21,8 +21,8 @@ public class DemoApplication {
 		// 1. creates the ApplicationContext (the IoC container)
 		// 2. component-scans + auto-configures -> registers every bean definition
 		// 3. resolves constructor dependencies between beans and instantiates them in
-		//    dependency order (this is where MessageController gets a real MessageService,
-		//    which gets a real MessageRepository, injected automatically)
+		//    dependency order (this is where AnnouncementController gets a real AnnouncementService,
+		//    which gets a real AnnouncementRepository, injected automatically)
 		// 4. starts the embedded servlet container (Tomcat by default) so the app can
 		//    actually receive HTTP requests
 		SpringApplication.run(DemoApplication.class, args);

@@ -4,8 +4,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 // @SpringBootTest boots the ENTIRE application context - every bean, including the real
-// DataSource/EntityManager - unlike MessageServiceTest (no Spring at all) or
-// MessageControllerTest's @WebMvcTest (web layer only). This is the slowest and heaviest
+// DataSource/EntityManager - unlike AnnouncementServiceTest (no Spring at all) or
+// AnnouncementControllerTest's @WebMvcTest (web layer only). This is the slowest and heaviest
 // of the three test styles, which is why there's only ONE such test in this whole project:
 // it exists purely to catch "does the application actually start" bugs (a missing bean, a
 // broken @Configuration, an unsatisfiable dependency) - not business logic, which belongs
