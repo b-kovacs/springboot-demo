@@ -6,7 +6,7 @@ debugged.
 
 ## Purpose
 
-Two goals from the start:
+Three goals from the start:
 
 1. Make the whole environment reproducible. Everything should be defined declaratively and
    rebuildable from source, so nothing important lives only in someone's head or in a step
@@ -14,6 +14,11 @@ Two goals from the start:
 2. Learn Kubernetes the way it actually gets used in production, not a toy cluster. That
    means multiple nodes, real container builds, a gateway, load balancing, persistent
    storage, GitOps for deployment, and CI running inside the cluster itself.
+3. Learn Spring Boot and Java properly, not by writing a throwaway CRUD stub. That means a
+   real layered architecture (Controller, Service, Repository, and DTOs instead of an
+   entity exposed directly over the API), a real three-tier testing strategy with actual
+   mocks instead of no tests at all, and deliberate choices behind the CRUD and API design,
+   not just whatever Spring's defaults happen to produce.
 
 ## What was built
 
