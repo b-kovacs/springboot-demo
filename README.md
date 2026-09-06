@@ -6,8 +6,7 @@ Kubernetes platform: this app is what it builds (via an in-cluster Tekton pipeli
 triggered automatically on every push to this repo), deploys, secures, and monitors.
 
 **Read `flux-infra`'s README first** if you're evaluating the platform work — this repo is
-deliberately the smaller half. What's here is worth reading for two different reasons
-depending on what you're looking for:
+deliberately the smaller half. Two things worth knowing before reading the code itself:
 
 ## ⚠️ This project runs a fictional, future Spring Boot version — read this before the code
 
@@ -89,13 +88,20 @@ show. See `application.properties` for the exact config and why each line is the
 
 ## Running it
 
-This app expects a Postgres instance and is meant to run inside the `flux-infra`-managed
-cluster (see that repo for the full path). To build the jar locally:
+The app needs a reachable Postgres — running the jar alone with no database will fail to
+start (Spring's JPA auto-configuration needs a working `DataSource`), which is expected,
+not a bug. Locally:
 
 ```bash
+# a throwaway Postgres matching the defaults in application.properties
+docker run -d --name demo-postgres -p 5432:5432 \
+  -e POSTGRES_USER=demo -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demodb postgres:17
+
 ./mvnw clean package
 java -jar target/demo-0.0.1-SNAPSHOT.jar
+# then: curl http://localhost:8080/messages
 ```
 
-<!-- race-condition-fix verification commit -->
-<!-- second race-guard verification commit -->
+In production this same jar runs unmodified inside the `flux-infra`-managed cluster, with
+`DB_HOST`/`DB_USER`/`DB_PASSWORD` supplied by Kubernetes instead of the `localhost`
+defaults — see the `${DB_HOST:localhost}` placeholder note in `application.properties`.
