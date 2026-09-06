@@ -1,209 +1,245 @@
 # What Went Badly
 
-The friction, dead-ends, and (mostly environmental) walls that cost the most time —
-and what to do differently.
+The friction, dead ends, and mostly environmental walls that cost the most time, and what
+to do differently next time.
 
-## The recurring theme: WSL + rootless networking
+## The recurring theme: WSL and rootless networking
 
-The single biggest source of pain. Running rootless containers inside WSL2 means there is
-**no clean host↔container↔outside network path**, and this wall was hit over and over:
+This was the single biggest source of pain. Running rootless containers inside WSL2 means
+there's no clean network path from outside the machine, through WSL, into a container, and
+this wall got hit over and over.
 
-- **MetalLB LoadBalancer IPs** were assigned correctly but **not routable from the WSL
-  host** (only reachable from inside the cluster). The load balancer "worked" but you
-  couldn't reach it from your browser.
-- **Gateway access** ultimately needed `kubectl port-forward` because no inbound path
-  existed.
-- **Mirrored networking mode** (tried to make Windows↔WSL localhost seamless) **broke
-  loopback *inside* WSL** — `127.0.0.1` connections got refused even with a server bound
-  and listening. Reverted to NAT mode.
-- **Webhook-based automation** (Tekton Triggers, Argo Events, GitHub webhooks) is
-  fundamentally impossible without a tunnel, because GitHub can't reach a laptop behind
-  NAT/WSL.
+MetalLB (the tool that hands out real IP addresses to Kubernetes load balancers) assigned
+IPs correctly, but they weren't reachable from the WSL host itself, only from inside the
+cluster. The load balancer technically worked, but you couldn't open it in a browser.
+Reaching the app's gateway ended up needing `kubectl port-forward` (tunneling a local port
+straight through the Kubernetes API server) because there was no other inbound path at all.
 
-**Takeaway:** rootless-kind-on-WSL is excellent for *learning* but fights you on anything
-requiring inbound or host-reachable networking. For always-on / externally-reachable
-needs, a real Linux VM or cloud cluster is the right tool. Pull-based patterns (Flux
-polling, self-hosted runners that poll outbound) are the WSL-friendly workarounds.
+WSL also has a "mirrored networking" mode meant to make `localhost` behave the same on
+Windows and inside WSL. Turning it on broke loopback connections inside WSL itself:
+`127.0.0.1` got refused even with a server actively listening on it. Went back to the
+default NAT networking mode instead.
 
-## Things that don't survive a WSL restart / cluster recreation
+And anything relying on a webhook, like Tekton Triggers, Argo Events, or a real GitHub
+webhook, is simply impossible without a tunnel, because GitHub has no way to reach a
+laptop sitting behind WSL and NAT.
 
-kind clusters are **ephemeral by nature** — a `wsl --shutdown` leaves node containers in a
-broken `Created` state with a dead API server. Recreation, not resume, is the workflow.
-Worse, several things had to be re-done manually after every recreate because they were
-never committed to Git:
+The takeaway: rootless `kind` on WSL is great for learning, but it fights you on anything
+that needs to be reached from outside, or needs the outside world to reach in. For
+anything that needs to run always-on or be reachable externally, a real Linux VM or a
+cloud cluster is the right tool. Pull-based patterns, like Flux polling Git or a
+self-hosted runner polling outbound, are the workaround that actually fits WSL.
 
-- `tekton-build` ServiceAccount + `git-credentials` secret
-- `registry-local` Service + EndpointSlice (for in-cluster DNS resolution)
-- The containerd insecure-registry node patch (so nodes can *pull* from the local registry)
+## Things that don't survive a WSL restart or a cluster recreation
+
+`kind` clusters are ephemeral by nature. Shutting down WSL leaves the node containers in a
+broken state with a dead API server, so the normal workflow is to recreate the cluster,
+not resume it. Worse, several things had to be manually redone after every recreate,
+because they had never actually been committed to Git:
+
+- The `tekton-build` ServiceAccount and the `git-credentials` secret
+- The `registry-local` Service and its endpoint, needed for in-cluster DNS resolution
+- The containerd configuration that lets nodes pull from the local registry over plain
+  HTTP
 - `postgres-secret`
-- File capabilities (`setcap` on `newuidmap`/`newgidmap`) don't persist across WSL restarts
+- A couple of file permissions (`setcap` on two specific binaries) that don't survive a
+  WSL restart on their own
 
-**This was the deepest lesson, learned the hard way:** every one of these is a thing that
-*should* be in Git/`kind-cluster.yaml`, and each one blocked progress until recreated.
-"It worked before" is meaningless if "before" was a manual step on a now-deleted cluster.
+This was the deepest lesson from this whole project, learned the hard way: every one of
+these should have been in Git or in `kind-cluster.yaml` from the start, and each one
+blocked progress until it was manually recreated. "It worked before" means nothing if
+"before" was a manual step on a cluster that no longer exists.
 
-## Cold-start slowness masquerading as failure
+## Cold-start slowness that looks exactly like failure
 
-On a fresh cluster, **every image pulls from the internet**, and heavy stacks (MetalLB's
-FRR pods, Tekton, Envoy) took several minutes each. This repeatedly *looked* like a hang
-or a failure (Flux Kustomization `timeout`, `context deadline exceeded`, pods stuck in
-`ContainerCreating`) when it was just slow. Time was lost both waiting and, worse,
-intervening on things that would have converged on their own.
+On a completely fresh cluster, every single image has to be pulled from the internet, and
+some of the heavier stacks (MetalLB's routing daemon, Tekton, Envoy) took several minutes
+each. This repeatedly looked like a hang or a real failure (a Flux timeout, a generic
+"context deadline exceeded," pods stuck in `ContainerCreating`) when it was actually just
+slow. Time got lost twice over: once waiting, and again by intervening on things that
+would have sorted themselves out on their own.
 
-## The layered-jar optimization was a rabbit hole
+## The layered-jar optimization was a dead end
 
-Trying to optimize image builds with Spring Boot **layered jars** (`extract --layers` +
-per-layer COPY) produced a **non-runnable image** — the `spring-boot-loader` layer
-extracted empty, so `JarLauncher` was `ClassNotFound` at runtime, even though the jar
-itself was perfectly valid. Chased this through Dockerfile paths and extraction syntax
-before falling back to plain `java -jar app.jar` on the fat jar (which always works,
-because the loader is inside the jar).
+Spring Boot supports splitting a jar into layers so a container image only needs to
+re-upload the layer that actually changed, instead of the whole jar every time. Trying
+this produced an image that didn't run at all: the layer containing Spring Boot's own
+loader classes came out empty, so the JVM couldn't find the class it needed to start the
+app, even though the jar itself was perfectly valid. After chasing this through several
+Dockerfile variations, the simple, reliable path won: copy the whole jar and run it with
+`java -jar`, which always works because the loader is bundled directly inside the jar.
 
-**Takeaway:** layered jars are a *push-size* optimization; the big build-speed win came
-from the **Maven cache**, which is independent. Don't reach for fragile optimizations
-before the simple, reliable path is working — and validate that an optimized image
-*actually runs*, not just that it builds.
+The takeaway: layered jars are an optimization for image push size, not build speed. The
+actual build-speed win came from caching Maven's dependencies, which is a completely
+separate thing. It's worth getting the simple, reliable version working first, and only
+reaching for a more fragile optimization afterward, and even then, actually confirming the
+optimized image runs, not just that it builds.
 
-## Ordering / dependency traps in Flux and Helm
+## Ordering problems in Flux and Helm, all self-inflicted
 
-Several self-inflicted layering bugs:
+A few different layering mistakes, all in the same family:
 
-- **CRD dry-run deadlock:** bundling MetalLB's *config* (IPAddressPool/L2Advertisement,
-  which needs the CRDs) with its *install* (the HelmRelease that creates the CRDs) in one
-  atomic Kustomization → the config's dry-run failed → the whole thing (including the
-  install) was blocked. Fix: separate config into its own layer with `dependsOn`.
-- **Root Kustomization recursion:** the Flux root scanned a directory and applied raw
-  sub-manifests directly instead of delegating to sub-Kustomizations, losing the
-  `dependsOn` ordering. Fix: an explicit `kustomization.yaml` listing only the
-  Kustomization definitions.
-- **HelmRelease default 5m timeout** was too short for cold-start installs; had to bump to
-  15m and add `remediation.retries`.
-- **`targetNamespace` conflicts:** one Kustomization forcing everything into `default`
-  clashed with resources that must live in a specific namespace (`metallb-system`).
+- Bundling a custom resource's configuration together with the tool that installs that
+  custom resource, in one atomic step. Concretely: MetalLB's IP address pool needs a
+  custom resource type that MetalLB's own install creates. Putting both in the same Flux
+  layer meant the config's dry-run check failed, since the custom resource type didn't
+  exist yet, which blocked the whole layer, install included. Fixed by giving the config
+  its own separate layer that explicitly waits for the install to finish first.
+- The top-level Flux configuration was scanning a folder and applying every file inside it
+  directly, instead of pointing at separate named layers. That flattened out the ordering
+  between layers entirely. Fixed with an explicit file listing only the layer definitions,
+  so their declared dependencies actually get respected.
+- Helm installs default to a five-minute timeout, which is too short for a slow, cold
+  install on a fresh cluster. Had to raise it to fifteen minutes and allow a couple of
+  retries.
+- One layer was forcing every resource into the `default` namespace, which broke anything
+  that needed to live in its own specific namespace, like MetalLB's own components.
 
-## The chase for a single app pod at the end
+## The chase for one working pod, near the end
 
-The final stretch — getting one `demo-app` pod to run — became a long chain of "recreate
-the missing manual piece, retry, hit the next missing piece." This was death by a thousand
-paper cuts, and it was a symptom of the un-committed-state problem above, compounded by
-fatigue. The right move (in hindsight) was to stop, commit the WIP, and do a single
-clean "close all the gaps" pass with fresh eyes rather than limp it across by hand.
+Getting a single app pod running, near the end of one long stretch, turned into a long
+chain of "recreate the missing manual piece, retry, hit the next missing piece." This was
+death by a thousand small cuts, and it was really just a symptom of the uncommitted-state
+problem above, made worse by simple fatigue. In hindsight, the better move would have been
+to stop, commit whatever was in progress, and come back with a clear head to close every
+gap in one deliberate pass, instead of trying to push through it manually one piece at a
+time.
 
-## A declarative fix introduced a new, subtler bug
+## Making something declarative introduced a new, subtler bug
 
-Bringing `kind-cluster.yaml` and the containerd registry config under home-manager (to
-close a "these files aren't in Git" gap) silently broke them: home-manager symlinks its
-managed files into `/nix/store`, but kind's `extraMounts` only bind-mounts the directory
-they live in — not `/nix/store` itself. From inside a fresh node's mount namespace, the
-symlink target didn't exist, so containerd found no `hosts.toml` and `demo-app` failed to
-pull its image on an otherwise-correct rebuild. Only the acid test caught this; reading the
-diff would not have (the file "existed" and had the right content, right up until something
-tried to actually resolve it from a different mount namespace).
+Bringing a couple of configuration files under Nix's management, specifically to close the
+gap of them not being tracked in Git at all, quietly broke them. Nix does this by
+replacing the real file with a symlink pointing into its own internal storage location.
+`kind` only mounts the one specific folder a node is told to mount, not the whole storage
+location a symlink inside that folder might point to. From inside a freshly created node,
+the symlink target simply wasn't there, so the container tool found no configuration and
+silently fell back to a default that didn't work.
 
-**Takeaway:** converting a plain file to a symlink (which is what most declarative
-config-management tooling does under the hood) is not a content-neutral change if anything
-downstream of it cares about the file being a *real, self-contained* file — bind mounts,
-container images, and anything else that copies or mounts by path rather than reading
-through the symlink first. Worth checking for this class of tool specifically whenever
-"make it declarative" is the fix being applied.
+Only the full rebuild test caught this. Reading the change itself would not have, because
+the file looked completely fine, with the right content, right up until something tried to
+actually follow the symlink from a different environment.
 
-## A fail-open fallback turned two small bugs into an unbounded-cost one
+The takeaway: turning a plain file into a symlink, which is what most declarative
+configuration tools do under the hood, is not a harmless change if anything downstream
+cares about the file being a real, self-contained file rather than just something with the
+right content at the right path. That includes bind mounts, container images, and anything
+else that copies or mounts by path instead of reading through a symlink first. Worth
+checking for this specific failure mode any time "make it declarative" is the fix being
+applied.
 
-The CI trigger `CronJob` had two independent, individually-minor bugs: no git credentials
-for the (private) app repo, and a Role missing the `patch` verb `kubectl apply` needs on an
-existing object. Neither alone would have been quiet — both would normally just show up as
-a visible error. But the script used `|| true` / `2>/dev/null` on the "read current state"
-steps (intended to handle the *first-ever run*, when there's no prior state yet), and that
-same fallback also swallowed the *auth* failure — turning "I couldn't tell what the latest
-commit is" into "the latest commit is empty," which then never matched the stored state, so
-the script concluded "new commit" and triggered a build. Every single 2-minute cycle. For
-about 35 minutes, unnoticed, before it was caught by watching pipeline counts over time
-rather than by reading the CronJob's YAML (which looked entirely reasonable).
+## A script that silently swallowed a failure instead of stopping
 
-**Takeaway:** a fallback meant for one specific, expected failure mode ("no state yet") can
-silently absorb a completely different, unexpected one ("I have no idea what's going on")
-if both produce the same empty/falsy value. In a script that *takes action* on a changed
-value, make the "I couldn't read this" case fail loudly and do nothing, rather than letting
-it fall through to the same code path as "yes, something legitimately changed."
+The scheduled job that checks for new commits and triggers a build had two separate,
+individually minor bugs: no credentials for the private repository it was checking, and a
+missing permission needed to save its own progress. Either one alone would have just
+caused a visible error. Together they were worse. The command that checks the latest
+commit failed silently and returned nothing. A fallback meant for a completely different
+situation (no saved state yet, on the very first run) quietly accepted that empty result
+too. An empty value never matched the previously saved one, so the script concluded there
+was a new commit and triggered a build. Every single cycle. For about half an hour,
+unnoticed, and the final step meant to save the new state also failed because of the
+missing permission, so nothing ever settled. It was caught by watching how many pipeline
+runs were piling up, not by reading the script and spotting the bug.
 
-## Two different DNS mechanisms looked like one, until they didn't
+The general point: in any automation that takes an action rather than just reporting
+something, it's safer to fail loudly and do nothing than to silently fall back to a value
+that makes the "go ahead and act" path look correct. A fallback that swallows an error is
+fine for a genuinely optional read. It's dangerous for the one read whose failure should
+stop the whole run.
 
-Both Tekton pods and the deployed app resolve `registry-local` successfully, which made it
-easy to assume it was "just a Kubernetes Service, resolvable everywhere." It's actually
-two unrelated things that happen to overlap: pods resolve it via CoreDNS + the Service
-object (namespace-scoped); nodes pulling images resolve it via nerdctl's own bridge-network
-container-name DNS (Kubernetes-unaware entirely). When `image-reflector-controller` (in a
-different namespace) couldn't resolve it, the tempting fix — change the image string to the
-fully-qualified Kubernetes name — would have "fixed" the controller while silently breaking
-every node-level image pull, because nerdctl's DNS has never heard of Kubernetes Service
-FQDNs. Caught by reasoning through *which specific consumer* was actually failing before
-touching anything, rather than generalizing from "it's a DNS problem, use the FQDN."
+## Two separate DNS systems looked like one, until they didn't
 
-## Both containers ran as root for the entire build, unnoticed
+Both the CI pipeline's pods and the deployed app itself could resolve the local
+registry's hostname without any trouble, which made it easy to assume it was just an
+ordinary Kubernetes Service, resolvable from anywhere. It's actually two unrelated
+mechanisms that happened to overlap. Pods resolve it through Kubernetes' own internal DNS,
+scoped to the Service's namespace. The nodes themselves, when pulling a container image,
+resolve it through the container runtime's own network, completely unaware Kubernetes DNS
+even exists. When a component watching the registry from a different namespace couldn't
+resolve it, the tempting fix, switching to the fully qualified Kubernetes name, would have
+fixed that one component while silently breaking every node's ability to pull images,
+since the container runtime's own DNS has no concept of a Kubernetes Service's full name.
+Caught by working out exactly which specific consumer was actually broken before changing
+anything, instead of generalizing from "this is a DNS problem, so use the full name."
 
-Neither `demo-app` nor `postgres` ever had a `securityContext` until a dedicated hardening
-pass, well after both had been rebuilt, restarted, and rebuilt-from-scratch (the acid test)
-multiple times. Running as root doesn't announce itself anywhere routine — `kubectl get
-pods` looks identical, the app works fine, probes pass. It only surfaced from a deliberate
-`kubectl exec ... -- id`. Retrofitting non-root onto Postgres specifically cost real
-complexity: its data directory had already been written to as root, so forcing non-root
-needed a one-time `initContainer` to `chown` the existing volume, whereas doing it from the
-very first deploy would have been free (either the volume starts empty and owned correctly,
-or the official image's own entrypoint drops privileges itself when it's allowed to start
-as root and self-manage the transition).
+## Both containers had been running as root the whole time
 
-## `envFrom` doesn't mean every tool that needs a credential can read it
+Neither the app nor the database ever had a security context set, until a dedicated
+hardening pass done well after both had been rebuilt, restarted, and rebuilt from scratch
+several times. Running as root doesn't announce itself anywhere obvious. A normal pod
+listing looks identical, the app works fine, health checks pass. It only surfaced from one
+deliberate check of who a process was actually running as inside the container. Fixing the
+database specifically cost real extra work, since its data directory had already been
+written to as root, so switching it to run as a non-root user needed a one-time setup step
+to fix file ownership first. Doing it correctly from the very first deploy would have cost
+nothing at all.
 
-The Postgres backup `CronJob` used `envFrom: secretRef: postgres-secret`, which sets
-environment variables named exactly `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` — but
-`pg_dump` (via libpq) specifically reads `PGPASSWORD`, not `POSTGRES_PASSWORD`. The job ran,
-connected, and failed cleanly with an authentication error rather than silently doing
-nothing — but it's a reminder that "the secret is mounted/exposed" and "the specific tool
-in this container knows to look for it under this exact name" are different claims, and the
-only way to know for certain is running the actual command, not reading the Deployment spec.
+## Giving a container access to a secret doesn't mean the specific tool inside it reads it correctly
 
-## A ServiceMonitor silently matched nothing, and nothing said why
+The database backup job pulled in a secret using a shortcut that sets environment
+variables named exactly after the secret's own keys, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+and so on. The actual backup tool, `pg_dump`, specifically looks for a variable named
+`PGPASSWORD`, not `POSTGRES_PASSWORD`. The job ran, tried to connect, and failed cleanly
+with an authentication error rather than doing nothing silently, which was at least easy to
+diagnose. But it's a good reminder that "the secret is available to this container" and
+"the specific tool running inside it knows to look for it under this exact name" are two
+different claims, and the only way to be sure is to actually run the command, not just
+read the deployment configuration.
 
-Wiring Prometheus to `demo-app` looked complete — matching labels on the `ServiceMonitor`,
-a correctly-routing Service, a named port lining up with the scrape endpoint — and produced
-no error anywhere: not in the `ServiceMonitor`, not in the Prometheus Operator's logs, not
-in the HelmRelease. The target just never appeared as scraped. Root cause:
-`ServiceMonitor.spec.selector` matches a Service's own `metadata.labels`, not its
-`spec.selector` (which only governs pod routing) — a distinction neither object's YAML
-states explicitly, and one that's easy to get right by accident (many example manifests
-put the same label in both places without explaining why both matter). Found only by
-reading Prometheus's live generated scrape config for the specific job and noticing the
-target was being discovered and then dropped by a relabel rule, not by rereading the YAML.
+## A monitoring rule silently matched nothing, with no explanation anywhere
 
-## Almost gave up on a real test rather than reading the actual dependency
+Wiring Prometheus up to scrape the app looked complete: matching labels on the rule, a
+Service that already routed correctly, a port name that lined up. Nothing produced an
+error, not in the rule, not in the Prometheus Operator's own logs, not anywhere. The
+target simply never showed up as scraped at all. The actual cause: the rule matches a
+Service by its own labels, not by the selector that controls which pods it routes traffic
+to, and neither object's configuration says that distinction out loud. It's an easy
+mistake to make by accident, since a lot of example manifests happen to set the same label
+in both places without ever explaining why both matter. Found only by reading Prometheus's
+own live, generated configuration for that specific job and noticing the target being
+discovered and then quietly dropped by an internal rule, not by rereading the YAML files
+themselves.
 
-A MockMvc-based controller test failed with two "package does not exist" errors in an
-unfamiliar Spring Boot version. The fast, plausible-sounding conclusion — "this project's
-renamed test starter must not include full web-slice testing support" — was wrong, and
-acting on it (rewriting the test as a lesser plain-unit-test substitute) would have shipped
-a weaker test permanently for a problem that was actually two specific, findable class
-relocations, resolvable in a few minutes by inspecting the real jars from Maven Central.
-**The tell, in hindsight:** the plausible conclusion was never actually checked against
-evidence — it explained the symptom well enough to feel true.
+## Almost gave up on a real test instead of reading the actual dependency
 
-## A Tekton workspace flaked once — and the "obvious" fix revealed the diagnosis was wrong
+A test using MockMvc failed with two "this doesn't exist" errors, in an unfamiliar,
+recently updated Spring Boot version. The fast, plausible-sounding explanation was that
+this project's differently named test dependency must simply not include full web-layer
+testing support, and rewriting the test as a plainer substitute felt like the easy way
+out. That would have been the wrong call, and permanently shipped a weaker test for a
+problem that was actually just two specific classes having moved to a new location,
+findable in a few minutes by looking inside the real published files on Maven Central. The
+lesson, in hindsight: that plausible explanation was never actually checked against any
+evidence. It just happened to explain the symptom well enough to feel true.
 
-A `PipelineRun` failed at the image-push step because the jar the previous step had just
-built "didn't exist," despite both steps sharing one declared workspace. The first
-explanation reached for — `local-path-provisioner`'s node-local PVs, "shared" only if the
-scheduler happens to co-locate every Task — was never actually verified (the failing run's
-pods were gone by the time it was investigated) and turned out to be **wrong**: Tekton
-already ships a built-in Affinity Assistant (on by default) that *guarantees* this exact
-co-scheduling via a dedicated assistant pod every Task gets a required affinity to. Building
-the "fix" is what exposed this — it failed immediately on contact with a mechanism that
-shouldn't have allowed the original symptom in the first place. The real cause is still
-unknown; the confident-sounding theory was retracted rather than left on record. See the
-corrected twelfth lesson in `README.md`.
+## A build failure got blamed on the wrong thing, and the wrong fix proved it
 
-## Small but recurring papercuts
+A build occasionally failed at the image-push step because it couldn't find a file the
+previous step had just built, despite both steps supposedly sharing one workspace. The
+first explanation was that the underlying storage type used for that shared workspace
+isn't reliably available across different nodes, and that a fix would need to force every
+step onto the same node. That explanation was never actually checked against a real
+failing run, since its pods were already gone by the time anyone looked, and it turned out
+to be wrong. Building a fix for it failed immediately, and revealed that the CI tool
+already has a built-in feature guaranteeing exactly that kind of same-node scheduling, on
+by default. Node placement was never the actual problem.
 
-- `zsh` treating pasted `# comments` as commands (`command not found: #`).
-- Pasting placeholder strings literally (`http://<EXTERNAL-IP>` → zsh redirect error).
-- `tkn pipelinerun logs -f` stopping at task boundaries, looking like a hang.
-- Fast-churning CrashLoopBackOff pods making logs impossible to catch (fix: scale to 0,
-  run the image as a standalone `--restart=Never` pod to read a stable log).
+The real cause, found afterward by comparing every failed build's timing against every
+other build running at the same time: two builds were sharing one fixed storage volume
+with no protection against both writing to it at once, so a later build's own cleanup step
+was deleting an earlier build's files while it was still running. Fixed by having the
+automated trigger check whether a build is already running before starting a new one. See
+the twelfth lesson in `README.md` for the full three-theory version of this story, since
+it's a good example of dropping a wrong theory instead of doubling down on it.
+
+## Small but recurring annoyances
+
+- The terminal's shell treating a pasted line starting with `#` as a command instead of a
+  comment, and complaining that `#` isn't a valid command.
+- Pasting a placeholder like `http://<EXTERNAL-IP>` literally, which the shell
+  misinterprets because of the angle brackets.
+- A log-streaming command that stops at the boundary between pipeline steps, which looks
+  like it hung when it's actually just waiting to be reattached to the next step.
+- Pods stuck in a fast restart loop churn too quickly to read their logs normally. The fix
+  that worked every time: scale the deployment to zero, run the same image as a single,
+  non-restarting pod, and read its log once, calmly.

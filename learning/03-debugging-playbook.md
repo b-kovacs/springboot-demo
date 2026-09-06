@@ -1,34 +1,37 @@
 # Debugging Playbook
 
-How to diagnose the recurring classes of problem from this build. Organized by symptom.
+How to diagnose the problems that came up repeatedly during this build, organized by
+symptom. Every command here was actually run against this cluster.
 
-## First principle: slow vs. broken
+## First check: is it actually broken, or just slow?
 
-On a fresh/cold cluster, most "stuck" states are **slow image pulls**, not failures.
-Always check before intervening:
+On a fresh or cold cluster, most "stuck" states are slow image pulls, not real failures.
+Always check before doing anything else:
 
 ```bash
-kubectl get pods -A                       # what's actually happening
-kubectl describe pod -n <ns> <pod> | grep -A10 Events   # "Pulling" vs a real error
+kubectl get pods -A
+kubectl describe pod -n <ns> <pod> | grep -A10 Events
 ```
 
-A `Pulling image ... in 5m52s` event = it was just slow. `context deadline exceeded` from
-a CLI (`flux reconcile`, `kubectl wait`) is usually the *command's* timeout, not a failure —
-re-check state with `flux get kustomizations` / `kubectl get pods` rather than trusting it.
+An event that says `Pulling image ... in 5m52s` just means it was slow. A
+`context deadline exceeded` from a CLI command like `flux reconcile` or `kubectl wait` is
+usually that command's own timeout being hit, not a real failure. Re-check the actual
+state with `flux get kustomizations` or `kubectl get pods` instead of trusting the error
+message from the CLI tool itself.
 
-## Cluster is down after a WSL restart
+## The cluster is down after a WSL restart
 
 Symptom: `The connection to the server 127.0.0.1:PORT was refused`.
 
-kind clusters don't survive `wsl --shutdown`. Diagnose and recreate:
+`kind` clusters don't survive `wsl --shutdown`. Diagnose, then recreate:
 
 ```bash
-kubectl get nodes                         # connection refused = cluster gone
-kind get clusters                         # is it known but dead?
-nerdctl ps -a | grep kind                 # nodes in 'Created'/'Exited' state?
+kubectl get nodes                         # connection refused means the cluster is gone
+kind get clusters                         # is it known to kind but dead?
+nerdctl ps -a | grep kind                 # are the nodes stuck in Created or Exited?
 ```
 
-Recreate (idempotent teardown handles the broken 'Created' state):
+Recreating handles the broken state cleanly:
 
 ```bash
 nerdctl rm -f kind-control-plane kind-worker kind-worker2 2>/dev/null
@@ -38,241 +41,265 @@ kind create cluster --config ~/kind-cluster.yaml
 
 ## A pod won't pull its image
 
-Symptom: `ImagePullBackOff` / `ErrImagePull`. Get the exact reason:
+Symptom: `ImagePullBackOff` or `ErrImagePull`. Get the exact reason:
 
 ```bash
 kubectl describe pod -n <ns> <pod> | grep -A6 Events
 ```
 
-Read the message carefully — the fixes are all different:
+Read the actual message carefully, since the fix is different for each case:
 
-- `docker.io/library/<name>: not found` → **bare image name** defaulting to Docker Hub.
-  The manifest is missing the registry prefix (`registry-local:5000/...`).
-- `http: server gave HTTP response to HTTPS client` → node's containerd trying **HTTPS on
-  a plain-HTTP registry**. Needs an insecure-registry `hosts.toml` on the nodes.
-- `dial tcp: lookup <name>: no such host` → **DNS**. The registry name isn't resolvable
-  from where the puller is (kubelet vs. pod DNS differ).
+- `docker.io/library/<name>: not found` means the image reference has no registry prefix,
+  so Kubernetes assumed Docker Hub by default. Add the real registry prefix.
+- `http: server gave HTTP response to HTTPS client` means the node's container runtime
+  tried HTTPS against a registry that only serves plain HTTP. It needs an
+  insecure-registry configuration file on the nodes.
+- `dial tcp: lookup <name>: no such host` is a DNS problem. The registry's name isn't
+  resolvable from wherever the pull is actually happening (a node pulling an image
+  resolves names differently than a pod does).
 
-## A build/CI pod can't reach the local registry
+## A build or CI pod can't reach the local registry
 
-Symptom (from Kaniko/Tekton): `lookup registry-local: no such host` or connection refused.
+Symptom, from Kaniko or another Tekton step: `lookup registry-local: no such host`, or a
+plain connection refused.
 
-The pod resolves via cluster DNS (CoreDNS), which doesn't know Docker-network container
-names. Check whether a Service/EndpointSlice exists to make it resolvable:
+The pod resolves names through cluster DNS, which has no idea about container names on a
+Docker-style network. Check whether a Service and its endpoint actually exist to make the
+name resolvable at all:
 
 ```bash
 kubectl get svc,endpointslice -n default | grep registry
-nerdctl exec kind-control-plane getent hosts registry-local   # can a node resolve it?
+nerdctl exec kind-control-plane getent hosts registry-local   # can a node itself resolve it?
 ```
 
-## A pod boots then crashes (CrashLoopBackOff)
+## A pod starts, then crashes, over and over
 
-The pods churn too fast to read logs normally. **Stop the loop and run a stable pod:**
+The pod churns too fast to read its logs normally. Stop the loop and run one stable copy
+instead:
 
 ```bash
 kubectl scale deployment/<name> -n <ns> --replicas=0
 kubectl run debug -n <ns> --restart=Never --image=<the-image> \
-  --env="KEY=value" ... --command -- <the-entrypoint>
+  --env="KEY=value" --command -- <the-entrypoint>
 sleep 15
 kubectl logs -n <ns> debug
 kubectl delete pod debug -n <ns>
 ```
 
-Also useful when a pod name keeps changing — target by label, and try `--previous`:
+Also useful when the pod's name keeps changing between restarts. Target it by label
+instead, and try the previous container's logs first:
 
 ```bash
 kubectl logs -n <ns> -l app=<name> --previous --tail=40 \
   2>/dev/null || kubectl logs -n <ns> -l app=<name> --tail=40
 ```
 
-## App can't authenticate to the database
+## The app can't authenticate to the database
 
-Symptom: `FATAL: password authentication failed`. Test each link separately —
-**socket vs TCP matters** (socket often uses trust auth and hides password problems):
+Symptom: `FATAL: password authentication failed`. Test the connection over each actual
+path separately, since a local socket connection often uses trust authentication and can
+hide a real password problem that only shows up over the network:
 
 ```bash
-# from inside the DB pod, over TCP (the app's real path):
+# from inside the database pod itself, over TCP, which is the app's real path:
 kubectl exec -n <ns> deploy/postgres -it -- env PGPASSWORD=<pw> \
   psql -h 127.0.0.1 -U <user> -d <db> -c '\conninfo'
 
-# from another pod, to the Service (the app's actual network path):
+# from a separate pod, through the Service, which matches the app's actual network path:
 kubectl run pgtest --restart=Never -n <ns> --image=postgres:17 --command -- \
   env PGPASSWORD=<pw> psql -h <svc> -U <user> -d <db> -c '\conninfo'
 kubectl logs -n <ns> pgtest && kubectl delete pod pgtest -n <ns>
 ```
 
-Also check for the classic **trailing newline in a secret** and **stale password on a
-persisted PVC** (Postgres only applies `POSTGRES_PASSWORD` on *first* init of an empty
-data dir — an old PVC keeps the old password):
+Also worth checking: a trailing newline accidentally baked into a secret's value, and a
+stale password left over on an old volume (Postgres only applies `POSTGRES_PASSWORD` the
+very first time it initializes an empty data directory, so an old volume keeps whatever
+password it was originally created with):
 
 ```bash
 kubectl get secret <s> -o jsonpath='{.data.PASSWORD_KEY}' | base64 -d | xxd | tail -1
 kubectl get secret <s> -o go-template='{{range $k,$v := .data}}{{$k}}={{$v|base64decode}}{{"\n"}}{{end}}'
 ```
 
-## A pipeline succeeded, but the pod still runs the old, broken build
+## A pipeline reports success, but the pod is still running the old, broken build
 
-Symptom: Tekton/CI reports `Succeeded`, you redeploy, and the pod crashes with an error
-that should already be fixed. Don't trust "the build exited 0" — verify what the cluster
-is *actually* running:
+Symptom: CI reports `Succeeded`, the pod gets redeployed, and it crashes with an error
+that's supposedly already fixed. Don't trust that the build exited cleanly. Check what the
+cluster is actually running:
 
 ```bash
-# 1. Does the registry really have this tag? (not just "did the push command exit 0")
+# does the registry really have this tag, not just "did the push command exit 0"?
 kubectl run reg-check --restart=Never --image=curlimages/curl --command -- sleep infinity
 kubectl exec reg-check -- curl -sI http://<registry-svc>:5000/v2/<image>/manifests/<tag>
-# 404 here means the registry has nothing for this tag, regardless of CI history —
-# e.g. an ephemeral registry container lost its storage on a restart.
+```
 
-# 2. What image is actually cached on each node, and since when?
+A `404` here means the registry genuinely has nothing under that tag, no matter what CI
+history claims.
+
+```bash
+# what image is actually cached on each node, and how old is it?
 nerdctl exec <kind-node> crictl images | grep <image>
 ```
 
-If the registry 404s but a node still has an old image ID cached under the *same tag*,
-you've found it: `imagePullPolicy: IfNotPresent` treats "tag exists locally" as good
-enough and never re-pulls, so the node keeps serving a stale/broken image forever no
-matter how many times CI rebuilds. Confirm by extracting the actual running artifact
-instead of guessing from logs alone — override the entrypoint so the container doesn't
-crash-loop while you look inside it:
+If the registry 404s but a node still has an old image cached under that same tag, that's
+the answer: a pull policy of "only pull if not already present" treats "the tag exists
+locally" as good enough and never re-pulls, so the node keeps serving the same stale image
+forever, no matter how many times CI rebuilds it.
+
+To confirm what's actually inside the image, rather than guessing from logs, override the
+entrypoint so it doesn't immediately crash-loop, and look inside directly:
 
 ```bash
 kubectl run jar-inspect --restart=Never --image=<image> --command -- sleep infinity
-kubectl exec jar-inspect -- ls -la /app          # does the layout match what you expect?
-kubectl exec jar-inspect -- sh -c "unzip -l /app/app.jar | head"   # or read the jar directly
+kubectl exec jar-inspect -- ls -la /app
+kubectl exec jar-inspect -- sh -c "unzip -l /app/app.jar | head"
 ```
 
-Fix: delete the stale cache entry and stop relying on a mutable tag for correctness —
-see [04-solutions-reference.md](04-solutions-reference.md#stale-image-served-from-cache-despite-a-successful-rebuild).
+Fix: delete the stale cached image and stop relying on a reused, mutable tag for
+correctness. See [`04-solutions-reference.md`](04-solutions-reference.md#stale-image-served-from-cache-despite-a-successful-rebuild).
 
-## Flux Kustomization won't go Ready
+## A Flux Kustomization won't go Ready
 
 ```bash
-flux get kustomizations              # which one, and the message
-flux get helmreleases -A             # are the Helm installs progressing?
-flux get all -A                      # everything, one view
+flux get kustomizations              # which one, and what message
+flux get helmreleases -A             # are the Helm installs still progressing?
+flux get all -A                      # everything in one view
 ```
 
-Common messages and meaning:
+Common messages and what they actually mean:
 
-- `dependency '...' is not ready` → ordering working; the dependency is still installing.
-- `no matches for kind "X"` → the **CRD doesn't exist yet** (its installer hasn't finished),
-  or a config resource is bundled with its own CRD's installer (dry-run deadlock).
-- `namespace not specified` → a resource lacks a namespace and the Kustomization has no
-  `targetNamespace`.
-- `health check failed ... timeout waiting for Deployment` → the *manifest* applied but a
-  pod isn't becoming healthy (look at that pod — usually image pull or crash).
+- `dependency '...' is not ready`: ordering is working correctly, that dependency just
+  hasn't finished installing yet.
+- `no matches for kind "X"`: the custom resource type doesn't exist yet, either because
+  its installer hasn't finished, or because a config resource got bundled with its own
+  installer in one step, which causes the dry-run deadlock described in
+  `02-what-went-badly.md`.
+- `namespace not specified`: a resource has no namespace set, and the Kustomization
+  applying it has no default namespace configured either.
+- `health check failed ... timeout waiting for Deployment`: the manifest itself applied
+  fine, but a pod isn't becoming healthy. Go look at that pod directly, usually an image
+  pull problem or a crash.
 
-Force a re-sync instead of waiting for the interval:
+Force an immediate sync instead of waiting for the normal interval:
 
 ```bash
 flux reconcile kustomization flux-system --with-source
 flux reconcile kustomization <name>
 ```
 
-## A file "exists" on the host but a container can't read it
+## A file "exists" on the host, but a container can't read it
 
-Symptom: a bind-mounted config file behaves as if it's missing (e.g. containerd falls back
-to a default instead of using it), even though `ls`/`cat` on the host confirms it's there
-with the right content. Check whether it's a symlink pointing *outside* whatever got
-mounted (common with declarative config tools like home-manager, which symlink into
-`/nix/store`):
+Symptom: a file that's bind-mounted into a container behaves as if it's missing (the
+container falls back to a default instead of using it), even though `ls` or `cat` on the
+host confirms the file is there with the right content. Check whether it's actually a
+symlink pointing outside whatever got mounted, which is common with declarative
+configuration tools like home-manager, which manage files by symlinking them into their
+own internal storage:
 
 ```bash
-ls -la <the-file>                                  # is it a symlink? to where?
+ls -la <the-file>                                     # is it a symlink, and pointing where?
 nerdctl exec <container> cat <path-inside-container>  # does it resolve from inside?
 ```
 
-If the host `ls` shows a symlink but the in-container `cat` says "No such file or
-directory," the mount doesn't cover the symlink's target — mount that target path too (see
-[04-solutions-reference.md](04-solutions-reference.md#home-manager-managed-files-that-must-be-readable-inside-kind-nodes)).
+If the host's `ls` shows a symlink, but the same file read from inside the container says
+"No such file or directory," the mount doesn't cover wherever the symlink actually points
+to. Mount that location too. See
+[`04-solutions-reference.md`](04-solutions-reference.md#home-manager-managed-files-that-must-be-readable-inside-kind-nodes).
 
-## A newly-added health probe is failing
+## A newly added health check is failing
 
-Check events, not just pod status — the message tells you whether it's a timing issue or a
-real failure:
+Check the pod's events, not just its status. The message tells you whether this is a
+timing issue or an actual failure:
 
 ```bash
 kubectl describe pod -n <ns> <pod> | grep -A5 "Liveness\|Readiness"
 ```
 
-`connection refused` right after rollout usually means the probe fired before the app was
-actually listening — check `initialDelaySeconds` against how long the app really takes to
-start. A **single** restart coinciding with when the probe was added (not a growing count)
-is often just the probe racing a slow first-time startup (e.g. Postgres's first `initdb`),
-not a misconfigured probe — watch restart count over a couple of minutes before concluding
-either way.
+A `connection refused` right after a rollout usually just means the check fired before the
+app was actually ready to accept connections. Compare `initialDelaySeconds` against how
+long the app genuinely takes to start. A single restart that happens right when a check
+was first added, rather than a restart count that keeps growing, is often just the check
+racing the app's own slow first-time startup (Postgres running its first-ever
+initialization, for example), not a misconfigured check. Watch the restart count over a
+couple of minutes before deciding either way.
 
-## A Service resolves for some pods but not others
+## A Service resolves for some pods, but not others
 
-Symptom: `dial tcp: lookup <svc> ... no such host` from one controller/pod, while other
-pods (or the nodes themselves) reach the same name fine. Check *which* DNS mechanism the
-failing consumer actually uses before touching the Service or image reference:
+Symptom: `dial tcp: lookup <svc> ... no such host` from one specific pod, while other pods
+(or the nodes themselves) reach the exact same name just fine. Check which DNS mechanism
+the failing consumer is actually using before touching the Service or the image reference
+at all:
 
 ```bash
 kubectl get pod <failing-pod> -n <ns> -o jsonpath='{.spec.serviceAccountName}{"\n"}'
-kubectl exec -n <ns> <failing-pod> -- cat /etc/resolv.conf     # search domains, ndots
+kubectl exec -n <ns> <failing-pod> -- cat /etc/resolv.conf
 ```
 
-A bare Service name (`registry-local`) only resolves via CoreDNS for pods **in that
-Service's own namespace** — a pod in a different namespace needs
-`<svc>.<namespace>.svc.cluster.local`. Separately, **node-level operations** (image pulls
-via containerd) may use a completely different resolver (on kind/nerdctl, the container
-runtime's own bridge-network DNS, resolving sibling *container* names — nothing to do with
-CoreDNS). Confirm which path is actually failing before deciding whether to change the
-Service, the image reference, or DNS config — changing the wrong one can silently break a
-path that was working. See
-[04-solutions-reference.md](04-solutions-reference.md#a-service-that-only-resolves-from-its-own-namespace-cross-namespace-consumers).
+A bare, unqualified Service name only resolves through Kubernetes' own DNS for pods that
+live in that Service's own namespace. A pod in a different namespace needs the full,
+qualified name instead. Separately, node-level operations, like an image pull happening
+through containerd, may use a completely different resolver: on `kind` with nerdctl, the
+container runtime's own bridge-network DNS, which resolves sibling container names and
+has nothing to do with Kubernetes DNS at all. Work out exactly which path is actually
+failing before deciding whether to change the Service, the image reference, or the DNS
+configuration itself. Changing the wrong one can silently break something that was
+already working. See
+[`04-solutions-reference.md`](04-solutions-reference.md#a-service-that-only-resolves-from-its-own-namespace-cross-namespace-consumers).
 
-## Debugging a CoreDNS `rewrite` rule that "should" match but doesn't
+## A CoreDNS rewrite rule that "should" match, but doesn't
 
 ```bash
-kubectl exec -n <ns> <pod> -- cat /etc/resolv.conf              # real search list + ndots
+kubectl exec -n <ns> <pod> -- cat /etc/resolv.conf              # the real search list and ndots setting
 kubectl exec -n <ns> <pod> -- nslookup <exact-fqdn-with-trailing-dot> <coredns-clusterip>
-kubectl logs -n kube-system -l k8s-app=kube-dns --tail=20        # confirm the reload happened
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=20        # did the config actually reload?
 ```
 
-Two non-obvious gotchas: with `ndots:5` (the k8s pod default) and a name with fewer dots,
-the resolver tries **search-domain-expanded forms first** — a rewrite rule matching only
-the bare name never fires, because CoreDNS never receives that literal query. And CoreDNS's
-`rewrite name exact` compares the **absolute DNS name including the trailing dot** — a rule
-written without one can silently never match. Isolate the problem by querying CoreDNS
-directly for the exact name you expect the resolver to send (from the `search`/`ndots`
-output), rather than testing the human-friendly short name and guessing why it fails.
+Two non-obvious things that both matter here. First, with the default `ndots` setting on
+a Kubernetes pod, a name with fewer dots than that setting gets tried in its
+search-domain-expanded forms first, so a rewrite rule that only matches the short, bare
+name never actually fires, because CoreDNS never receives that literal query in the first
+place. Second, CoreDNS's exact-match rewrite rule compares the full, absolute DNS name,
+including its trailing dot, so a rule written without one can silently never match
+anything. Isolate the problem by directly querying CoreDNS for the exact name you'd expect
+the resolver to actually send (visible in the pod's own resolv.conf), rather than testing
+the short, human-friendly name and guessing why it fails.
 
-## A recurring/automated job is doing something every run when it shouldn't
+## A recurring or automated job does something every single run when it shouldn't
 
-Symptom: a `CronJob`-driven trigger (or similar "check state, act on change" script) acts
-every single run instead of converging to "no change." Check whether a fallback meant for
-one failure mode (`|| true`, `2>/dev/null`) is silently swallowing a *different* failure —
-an empty/wrong value read for the "current state" check will make it look like "always
-changed":
+Symptom: a scheduled trigger, or any similar "check state, act only if it changed" script,
+takes action every run instead of settling into "no change." Check whether a fallback
+meant for one specific failure case is silently swallowing a completely different one. An
+empty or wrong value read for the "what's the current state" check will always look like
+"something changed":
 
 ```bash
 kubectl logs -n <ns> job/<latest-job>        # does it show a real value, or an empty one?
-kubectl get pipelinerun -n <ns> --sort-by=.metadata.creationTimestamp | tail -5   # is the count still growing?
+kubectl get pipelinerun -n <ns> --sort-by=.metadata.creationTimestamp | tail -5   # still growing?
 ```
 
-If the state read can plausibly fail (auth, RBAC, network), make that failure loud
-(`exit 1` before any decision logic) rather than falling through into the "act" branch —
-see [04-solutions-reference.md](04-solutions-reference.md#pull-based-ci-trigger-cronjob-polling-a-private-repo).
+If the state read can plausibly fail, due to authentication, permissions, or the network,
+make that specific failure loud (exit with an error immediately) instead of letting it
+fall through into the same code path as "yes, this genuinely changed." See
+[`04-solutions-reference.md`](04-solutions-reference.md#pull-based-ci-trigger-cronjob-polling-a-private-repo).
 
 ## Is this container actually running as root?
 
-Nothing in routine pod status shows this — check explicitly:
+Nothing in routine pod status shows this. Check explicitly:
 
 ```bash
 kubectl exec -n <ns> deploy/<name> -- id
 ```
 
-If it says `uid=0(root)`, there's no `securityContext` doing anything, regardless of what
-the base image's own Dockerfile might suggest. Before adding `runAsNonRoot: true` to an
-existing Deployment with a persistent volume, check what UID last wrote to that volume —
-forcing a UID mismatch against existing data is a permission-denied crash waiting to
-happen; see the `initContainer` chown pattern in
-[04-solutions-reference.md](04-solutions-reference.md#running-postgres-as-non-root-when-the-volume-already-has-root-owned-data).
+If the answer is `uid=0(root)`, there's no security context doing anything, regardless of
+what the base image's own setup might suggest. Before adding a non-root requirement to an
+existing deployment that already has a persistent volume, check which user last actually
+wrote to that volume. Forcing a mismatched user against existing files is a
+permission-denied crash waiting to happen. See the one-time ownership-fix pattern in
+[`04-solutions-reference.md`](04-solutions-reference.md#running-postgres-as-non-root-when-the-volume-already-has-root-owned-data).
 
 ## Does this Kubernetes security feature actually do anything here?
 
-Don't assume — test it in a throwaway namespace before relying on it for real:
+Don't assume. Test it directly, in a throwaway namespace, before relying on it for real:
 
 ```bash
 kubectl create namespace netpol-test
@@ -286,116 +313,126 @@ spec: { podSelector: {}, policyTypes: ["Ingress"] }
 EOF
 kubectl run np-client -n netpol-test --image=curlimages/curl --restart=Never --command -- \
   sh -c "curl -s -m 5 -o /dev/null -w '%{http_code}\n' http://np-target.netpol-test.svc.cluster.local || echo BLOCKED"
-# expect BLOCKED / a timeout, not a 200 - if you get a 200, this CNI doesn't enforce
-# NetworkPolicy and every policy you write from here is a no-op
 kubectl delete namespace netpol-test
 ```
 
-A NetworkPolicy that's silently unenforced is worse than no NetworkPolicy at all — it
-implies a protection that isn't there. `kindnet` (kind's default CNI) has not always
-enforced NetworkPolicy; check the specific cluster, don't assume from Kubernetes docs alone.
+Expect `BLOCKED` or a timeout, not a `200`. A `200` here would mean this cluster's
+networking plugin doesn't actually enforce `NetworkPolicy` at all, and every policy
+written from that point on is a no-op. This project's actual output from this exact test:
 
-## Backup/maintenance job fails with an auth error despite the secret being mounted
+```
+000
+BLOCKED
+```
 
-`envFrom: secretRef` sets env vars under the secret's own key names
-(`POSTGRES_PASSWORD`), but the specific tool you're running may expect a different,
-tool-conventional name (`pg_dump`/`psql` read `PGPASSWORD`). Check what the failing command
-actually reads:
+## A backup or maintenance job fails with an auth error, despite the secret being mounted
+
+Using `envFrom` with a secret sets environment variables named exactly after that secret's
+own keys, like `POSTGRES_PASSWORD`. The specific tool running inside the container might
+expect a different, tool-specific name instead. `pg_dump` and `psql`, for example, read
+`PGPASSWORD`, not `POSTGRES_PASSWORD`. Check what the failing command actually reads:
 
 ```bash
 kubectl logs -n <ns> job/<name>              # the auth error usually names what's missing
 ```
 
-Add an explicit `env` entry (`valueFrom.secretKeyRef`) under the name the tool expects,
-alongside (not instead of) `envFrom` if other parts of the same command use the original
-names.
+Fix by adding one explicit environment variable under the name the tool actually expects,
+alongside the existing `envFrom`, not instead of it, if other parts of the same container
+still rely on the original names.
 
 ## A ServiceMonitor exists, the Service routes fine, but Prometheus never scrapes it
 
-No error appears anywhere for this one — check Prometheus's own generated config and live
-target list, not the YAML:
+No error shows up anywhere for this one. Check Prometheus's own generated configuration
+and its live target list directly, not the YAML files:
 
 ```bash
 kubectl exec -n <ns> <prometheus-pod> -c prometheus -- \
   wget -qO- 'http://localhost:9090/api/v1/status/config' | grep -A3 "job_name: serviceMonitor/<ns>/<name>"
 kubectl exec -n <ns> <prometheus-pod> -c prometheus -- \
-  wget -qO- 'http://localhost:9090/api/v1/targets?state=any'   # check droppedTargets, not just activeTargets
+  wget -qO- 'http://localhost:9090/api/v1/targets?state=any'
 ```
 
-If the job exists in the config but the target is only in `droppedTargets`, look at the
-relabel step referencing `__meta_kubernetes_service_label_<key>` — that checks the
-**Service's own `metadata.labels`**, not `spec.selector`. Add the label directly on the
-Service:
+Check the second command's `droppedTargets`, not just `activeTargets`. If the job shows up
+in the generated config, but the target only appears in `droppedTargets`, look at the
+relabel step referencing a Service label. That checks the Service's own `metadata.labels`,
+not its `spec.selector`. Add the missing label directly on the Service:
 
 ```yaml
 metadata:
   labels:
-    app: demo-app   # ServiceMonitor.spec.selector matches THIS, not spec.selector below
+    app: demo-app   # the ServiceMonitor's selector matches THIS, not spec.selector below
 spec:
   selector:
     app: demo-app
 ```
 
-## Verifying a class/package actually exists in an unfamiliar or relocated dependency
+## Verifying a class or package actually exists in an unfamiliar or recently changed dependency
 
-Don't guess from memory or assume a starter "must not include" something — check the real
-artifact:
+Don't guess from memory, and don't assume a differently named dependency must be missing
+something. Check the real, published artifact directly:
 
 ```bash
-curl -s "https://repo1.maven.org/maven2/<group-path>/<artifact>/<version>/<artifact>-<version>.pom" | grep artifactId   # what it depends on
+curl -s "https://repo1.maven.org/maven2/<group-path>/<artifact>/<version>/<artifact>-<version>.pom" | grep artifactId
 curl -sL "https://repo1.maven.org/maven2/<group-path>/<artifact>/<version>/<artifact>-<version>.jar" -o x.jar
-unzip -l x.jar | grep <ClassName>.class    # exact package, definitively
+unzip -l x.jar | grep <ClassName>.class
 ```
 
-This is faster and more reliable than searching docs for a specific/unfamiliar version, and
-it's the only way to be *certain* — a plausible-sounding "this must not be supported"
-conclusion is a hypothesis, not a finding, until checked this way.
+This is faster and more reliable than searching documentation for an unfamiliar version,
+and it's the only way to actually be certain. A plausible-sounding "this must not be
+supported" conclusion is a guess, not a finding, until it's checked this way.
 
 ## A Tekton step can't find a file the previous step just built
 
-Check node placement as a first diagnostic step, but don't stop there — Tekton's built-in
-Affinity Assistant (`coschedule: workspaces`, on by default) already *requires*
-co-scheduling for every Task sharing a PVC-backed workspace, so a genuine node mismatch
-should be structurally prevented, not just usually-avoided:
+This one had a real, confirmed answer found the hard way, so it's worth walking through in
+full rather than just giving the fix. The two things to check, in order:
 
 ```bash
-kubectl get statefulset -n <ns> | grep affinity-assistant     # is it actually running?
+kubectl get statefulset -n <ns> | grep affinity-assistant
 kubectl get pod -n <ns> -l tekton.dev/pipelineRun=<name> -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
-kubectl get pod -n <ns> <task-pod> -o jsonpath='{.spec.affinity}'   # required affinity to the assistant pod?
 ```
 
-If the assistant StatefulSet exists and the Task pod's affinity correctly references it,
-nodes matching is not luck — it's enforced, and a node-locality theory for the failure is
-probably wrong. Look elsewhere (transient Kaniko/overlay-fs issue, a genuinely different
-race) rather than reaching for "add node affinity," which in this setup would be solving an
-already-solved problem — and, if written by hand rather than relying on the built-in
-assistant, has its own trap: Tekton does not substitute `$(context...)` variables inside
-`podTemplate.affinity`, so a hand-rolled per-run label match silently becomes a literal,
-invalid string.
-
-## Tekton pipeline debugging
+Tekton has a built-in feature, on by default, that already guarantees every step of one
+build lands on the same node, so a genuine node mismatch should be structurally
+impossible, not just usually avoided. If that feature is present and working (the first
+command shows a StatefulSet, and every task pod landed on the same node), the actual cause
+is very likely a race between two separate builds sharing the same storage volume at the
+same time, not a scheduling problem at all:
 
 ```bash
-tkn pipelinerun describe --last      # per-task status: which failed, which skipped
-tkn pipelinerun logs --last -f       # streamed logs (stops at task boundaries — re-attach)
-kubectl get taskrun <tr> -o jsonpath='{.status.conditions[0].message}'  # exact failure
+kubectl get pipelinerun -n <ns> -o json \
+  | jq -r '.items[] | "\(.status.startTime) \(.status.completionTime) \(.metadata.name)"' | sort
 ```
 
-`Failed(CouldntGetTask)` = the referenced Task doesn't exist. `TaskRunValidationFailed` =
-a structural problem in the Task/Run spec (the jsonpath message names it, e.g. "more than
-one PersistentVolumeClaim is bound" → a TaskRun can only have one PVC-backed workspace).
+Look for two runs whose time ranges overlap. If they do, one run's own cleanup step
+(deleting old files before a fresh checkout) is very likely deleting the other run's files
+while it's still running. The fix is to stop the automated trigger from starting a new
+build while one is already in progress, not to fiddle with node placement, which was never
+actually the problem.
 
-## Buildkit not reachable (nerdctl build fails)
+## General Tekton pipeline debugging
 
 ```bash
-systemctl --user status buildkit     # is the rootless buildkitd service up?
-journalctl --user -u buildkit -n 50 --no-pager   # why it failed to start
+tkn pipelinerun describe --last      # per-step status: what failed, what got skipped
+tkn pipelinerun logs --last -f       # streamed logs, stops at step boundaries, reattach as needed
+kubectl get taskrun <tr> -o jsonpath='{.status.conditions[0].message}'   # the exact failure reason
 ```
 
-## General "which containerd namespace / registry state" checks
+`Failed(CouldntGetTask)` means the Task being referenced doesn't exist. A
+`TaskRunValidationFailed` message names the actual structural problem directly, for
+example "more than one PersistentVolumeClaim is bound," which means a single TaskRun can
+only use one PVC-backed workspace at a time.
+
+## Buildkit isn't reachable, and `nerdctl build` fails
 
 ```bash
-nerdctl ps -a | grep -i regist                        # what registries exist
-nerdctl inspect <container> | grep -i ipaddress       # a container's kind-network IP
-nerdctl exec <registry> wget -qO- http://localhost:5000/v2/_catalog   # what's cached/pushed
+systemctl --user status buildkit                  # is the rootless buildkitd service up?
+journalctl --user -u buildkit -n 50 --no-pager    # why did it fail to start?
+```
+
+## General checks for registry state and containerd namespaces
+
+```bash
+nerdctl ps -a | grep -i regist                                       # what registries exist
+nerdctl inspect <container> | grep -i ipaddress                      # a container's network IP
+nerdctl exec <registry> wget -qO- http://localhost:5000/v2/_catalog  # what's actually pushed
 ```
