@@ -7,10 +7,10 @@ can read them through a REST API, instead of announcements getting lost in chat.
 This is one half of a two-repo project. The other half,
 [flux-infra](https://github.com/b-kovacs/flux-infra), is a full Kubernetes platform
 managed with GitOps. It builds this app through an automated pipeline, deploys it,
-secures it, and monitors it. Both halves matter equally to the project, but the app is
-deliberately kept small: the goal was to learn as much as possible about the platform
-side, so the app just needed to be real enough to build, test, deploy, and monitor
-properly, not to carry a lot of business logic of its own.
+secures it, and monitors it. Both halves matter equally, and both are kept to the basics
+on purpose: enough Spring Boot to be a real, properly layered, properly tested service,
+and enough Kubernetes to be a real, properly automated platform, without either side
+growing beyond what's needed to actually learn the fundamentals well.
 
 ## A quick note on the Spring Boot version
 
