@@ -30,9 +30,14 @@ practice.
 
 This project doubles as study material for me, so the usual "don't over-comment, let
 well-named code speak for itself" rule is relaxed here on purpose. Every file explains the
-Spring concept or design decision it demonstrates, right where it happens. If you want to
-judge how I write production code day to day, weigh the `flux-infra` manifests and the
-layering decisions here more than the comment density.
+Spring concept or design decision it demonstrates, right where it happens. The
+`flux-infra` manifests are commented the same way and for the same reason, so comment
+density on its own isn't a useful signal of how either of us would write production code
+day to day. A better signal is the actual decisions underneath the comments: why a DTO
+exists instead of returning the entity directly, why the service layer is unit-tested
+with no Spring context involved at all, why one Kustomization layer waits on another
+instead of everything being applied at once. Those choices would still be there with
+every comment stripped out.
 
 ## What's in this repo
 
