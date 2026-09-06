@@ -1,371 +1,342 @@
-# Homelab Platform — Build Learnings
+# Homelab Platform: Build Learnings
 
-A record of building a full, self-hosted, GitOps-managed Kubernetes platform on a
-rootless, declarative base running under WSL2 — and everything learned (the good,
-the bad, and the debugging) along the way.
+A record of building a full, self-hosted Kubernetes platform on a rootless, declarative
+base under WSL2. This covers what went right, what went wrong, and how each problem got
+debugged.
 
 ## Purpose
 
-The goal was twofold:
+Two goals from the start:
 
-1. **Make an "immutable / reproducible system"** — an environment defined declaratively,
-   rebuildable from source, where nothing important lives only in someone's head or in
-   an un-tracked manual step.
-2. **Learn Kubernetes close to production** — not toy clusters, but the real shapes:
-   multi-node, container builds, ingress/gateway, load balancing, persistent storage,
-   GitOps CD, and in-cluster CI.
+1. Make the whole environment reproducible. Everything should be defined declaratively and
+   rebuildable from source, so nothing important lives only in someone's head or in a step
+   nobody wrote down.
+2. Learn Kubernetes the way it actually gets used in production, not a toy cluster. That
+   means multiple nodes, real container builds, a gateway, load balancing, persistent
+   storage, GitOps for deployment, and CI running inside the cluster itself.
 
 ## What was built
 
-A complete platform, layer by layer:
+- **A declarative OS layer.** Ultramarine Linux under WSL2, with the whole user
+  environment defined in a Nix and home-manager flake, rebuildable from a single
+  `install.sh` script.
+- **A rootless container runtime.** containerd, nerdctl, and buildkit, all running as
+  declarative user-level systemd services. No Docker daemon, nothing running as root.
+- **A multi-node Kubernetes cluster**, using `kind` (vanilla, upstream Kubernetes running
+  as containers), plus a pull-through cache for external images and a local registry to
+  push built images to.
+- **A real application.** A Spring Boot service with a database, built with VS Code over
+  Remote-WSL and containerized with the local buildkit setup.
+- **Networking through the Gateway API.** This is the newer, Kubernetes-native way to
+  route traffic (the objects are called `GatewayClass`, `Gateway`, and `HTTPRoute`),
+  running through Envoy Gateway, plus MetalLB to hand out real IP addresses to load
+  balancer Services. Worth being precise here: "Gateway API" and "API Gateway" are
+  different things that happen to overlap in this setup. An API Gateway usually means
+  extra features like authentication and rate limiting. Envoy Gateway can do that too
+  through its own extra resources, but none of that is configured yet.
+- **Persistent storage**, tested by actually deleting pods and confirming the data
+  survived.
+- **GitOps deployment with Flux**, which watches a Git repository (`flux-infra`) and keeps
+  the cluster matching it. Proven by deleting the cluster entirely and rebuilding it from
+  that repo alone, with one manual step: reloading the encryption key used for secrets
+  (explained in lesson four).
+- **Secrets encrypted before they ever reach Git**, using SOPS and age. No plaintext
+  secret sits in the `flux-infra` repository.
+- **A fully automated CI pipeline**, built with Tekton and itself managed by Flux. It
+  clones the app, builds and tests it with Maven, builds a container image with Kaniko,
+  and pushes it with a unique tag. A scheduled job checks the app repo for new commits,
+  since a real webhook can't reach this machine (no way for GitHub to send a request
+  through WSL and NAT).
+- **Automatic deployment of new builds.** Flux watches the registry, notices a new image,
+  and commits the update back into the `flux-infra` repo itself, closing the loop. Tested
+  by pushing a real code change and watching it reach a running pod with nobody touching
+  `kubectl`.
+- **Production hardening**, done in stages: health checks and resource limits, a
+  properly automated CI/CD pipeline, security and reliability work (network policies,
+  non-root containers, backups), and monitoring with Prometheus. The one thing still open
+  is TLS and extra features on the gateway.
+- **Real application code, not a placeholder.** The app's core feature started as a
+  database entity exposed directly over the API, with no service layer, no separate
+  request/response objects, and no tests. It was refactored into a proper layered design,
+  and the test suite actually runs in CI now.
 
-- **Declarative OS layer** — Ultramarine Linux under WSL2, whole user environment defined
-  in a Nix / home-manager flake, reproducible via an `install.sh` bootstrap.
-- **Rootless container runtime** — containerd + nerdctl + buildkit, all as declarative
-  user systemd services. No Docker daemon, no root.
-- **Multi-node Kubernetes** — a 3-node `kind` cluster (vanilla upstream), plus a
-  pull-through registry cache and a local push registry.
-- **A real application** — a Spring Boot 4 + JPA app, developed and debugged in VS Code
-  (Remote-WSL), containerized with the local buildkit.
-- **Networking** — **Gateway API** (the Kubernetes-native routing spec: `GatewayClass` /
-  `Gateway` / `HTTPRoute`) via Envoy Gateway (hostname routing) and MetalLB for LoadBalancer
-  IPs. Worth being precise about the name: "Gateway API" (this) and "API Gateway" (the
-  functional pattern — auth, rate limiting, protocol translation) are different concepts
-  that happen to be implemented by the same component here; Envoy Gateway *could* also
-  provide the API-gateway features via its own `SecurityPolicy`/`BackendTrafficPolicy`
-  CRDs, but none of those are configured yet — see open gaps.
-- **Persistent storage** — PVCs, proven to survive pod deletion.
-- **GitOps CD** — Flux reconciling the entire stack from a `flux-infra` Git repo;
-  proven to rebuild the whole stack (`demo-app` and `postgres` included) after a full
-  `kind delete cluster` + recreate + `flux bootstrap`, with a single manual step
-  (re-provisioning the SOPS age key — see lesson four below).
-- **Secrets in Git, safely** — SOPS + age; no plaintext secret in `flux-infra`.
-- **In-cluster CI, fully automated** — Tekton (itself Flux-managed): clone → Maven build
-  (cached) → Kaniko image build → push a unique, chronologically-sortable tag. A
-  `CronJob` polls the source repo (pull-based — a real webhook is impossible on this
-  WSL/NAT setup) and triggers a build on every new commit, no manual step.
-- **Flux image automation** — `ImageRepository`/`ImagePolicy`/`ImageUpdateAutomation` watch
-  the registry, pick the newest build, and auto-commit the Deployment update back into
-  `flux-infra`. Verified end-to-end: a real code change flowed from `git push` all the way
-  to a running pod with zero manual intervention.
-- **Production hardening (in progress)** — health probes + resource limits (lesson five),
-  CI/CD maturity (lessons six/seven), security + reliability (lessons eight/nine: default-deny
-  `NetworkPolicy`, non-root containers, `automountServiceAccountToken: false`, PDBs,
-  Postgres backups), and observability (lesson ten: `kube-prometheus-stack` via Flux,
-  `demo-app` scraped for real JVM/HTTP metrics) all done. TLS + API-gateway features on the
-  Gateway are the one open next step.
-- **Real application code, not a skeleton** — the app's `Message` CRUD was refactored from a
-  JPA entity exposed directly over REST (no service layer, no DTOs, no tests) into a
-  properly layered Controller → Service → Repository with request/response DTOs, a
-  not-found exception + `@RestControllerAdvice`, and both unit tests (Mockito) and a real
-  `MockMvc` slice test (lesson eleven) — with CI actually running them (`-DskipTests` removed).
+## The documents in this folder
 
-## The documents
+- [`01-what-went-well.md`](01-what-went-well.md): decisions and habits that paid off.
+- [`02-what-went-badly.md`](02-what-went-badly.md): friction, dead ends, and the
+  environmental problems (mostly WSL and rootless containers) that cost the most time.
+- [`03-debugging-playbook.md`](03-debugging-playbook.md): how to diagnose the recurring
+  problem types, with the actual commands.
+- [`04-solutions-reference.md`](04-solutions-reference.md): concrete fixes, copy-paste
+  ready.
+- [`05-architecture-and-impact.md`](05-architecture-and-impact.md): how the pieces fit
+  together, why each one exists, and what it's actually worth.
+- [`06-open-gaps-and-next-steps.md`](06-open-gaps-and-next-steps.md): what's still manual
+  or uncommitted, and the plan to close it.
 
-- **[01-what-went-well.md](01-what-went-well.md)** — decisions and patterns that paid off.
-- **[02-what-went-badly.md](02-what-went-badly.md)** — friction, dead-ends, and the
-  environmental walls (mostly WSL/rootless) that cost the most time.
-- **[03-debugging-playbook.md](03-debugging-playbook.md)** — how to diagnose the recurring
-  classes of problem, with the exact commands.
-- **[04-solutions-reference.md](04-solutions-reference.md)** — concrete fixes for each
-  problem, copy-paste ready.
-- **[05-architecture-and-impact.md](05-architecture-and-impact.md)** — how the pieces fit,
-  why each exists, and what it's worth.
-- **[06-open-gaps-and-next-steps.md](06-open-gaps-and-next-steps.md)** — what's still
-  manual / uncommitted, and the punch-list to finish the "fully reproducible" goal.
+## Lesson one: if it isn't committed to Git, it won't survive a fresh cluster
 
-## The single biggest lesson
+Every painful detour late in the build traced back to something created by hand instead
+of through Git: a ServiceAccount, a Secret, a Service, a change made directly on a node.
+All of it vanished the moment the cluster got recreated. This is the entire reason GitOps
+exists, and the reason secrets need to be encrypted before they go into Git rather than
+left out of it entirely. It's a simple rule, but it took getting burned by it repeatedly
+to actually internalize.
 
-**Anything not committed to Git does not survive a fresh cluster.** Every painful
-detour late in the build traced back to a resource created by hand (a ServiceAccount, a
-Secret, a Service, a node-level containerd patch) that vanished on cluster recreation.
-That is the entire reason GitOps — and encrypted-secrets-in-Git (SOPS/Sealed Secrets) —
-exist. The lesson was learned the hard way, which is the way it sticks.
+## Lesson two: a pipeline reporting success doesn't mean the cluster is running that build
 
-## The second big lesson: "the pipeline succeeded" ≠ "the cluster is running that build"
+The app going into a restart loop looked like a database or Dockerfile problem. It wasn't.
+Two separate infrastructure issues were compounding each other.
 
-`demo-app`'s CrashLoopBackOff — the open issue at the end of the previous session — turned
-out to have nothing to do with the database or the Dockerfile. Two infra facts compounded:
+First, the local registry returned a 404 for an image tag that several "successful"
+Tekton runs had supposedly pushed, even though it had a persistent volume attached. My
+first guess was that it had lost its storage. That guess was wrong, and I want to flag
+that clearly because an earlier version of this document stated it as fact. The volume
+was fine. The more likely cause was that the network address the pods used to reach the
+registry didn't match the registry container's actual address at the time of the push.
+The real lesson: don't trust the first theory that sounds plausible without checking it
+against the evidence.
 
-1. **`registry-local` returned `404` for a tag that multiple "successful" Tekton runs had
-   supposedly pushed**, despite actually having a persistent volume (`registry-local-data`)
-   — so the naive "it must have lost its storage" theory (my first guess) was wrong. The
-   likely real cause: the EndpointSlice/IP the pods used to reach it didn't match the
-   container's address at push time. Correction noted here because it was stated wrong in
-   an earlier version of this doc — the volume was fine; don't trust the first plausible
-   theory without checking it against the actual evidence.
-2. **A worker node still had an old, broken image cached under that same mutable tag**
-   (`demo-app:1.0`). With `imagePullPolicy: IfNotPresent`, kubelet saw the tag already
-   existed locally and never re-pulled — so every subsequent rebuild was invisible to the
-   running Deployment, no matter how many times the pipeline reported success.
+Second, a worker node still had an old, broken image cached under that same tag. Because
+the pull policy was set to only pull if the image wasn't already present, the node just
+kept using its stale copy, no matter how many times the pipeline rebuilt the image.
 
-The fix required proving the actual state instead of trusting status output: query the
-registry's own API for the manifest (not "did the TaskRun exit 0"), and check what image
-digest is *actually cached on the node* (`crictl images`) versus what the registry
-currently serves. Once both were confirmed stale, deleting the cached image
-(`crictl rmi`) and switching to `imagePullPolicy: Always` closed the loop — the same class
-of fix as lesson one: **a mutable tag plus a cache (registry or node) is a hidden
-"not really in sync with Git/CI" gap, just like an uncommitted manual resource.**
+Fixing this meant checking the actual state instead of trusting reported status: querying
+the registry's own API for the image manifest, and checking what image was actually
+cached on the node, rather than just checking whether the build step exited successfully.
+Once both were confirmed stale, deleting the cached image and switching the pull policy to
+always pull closed the gap. It's the same category of problem as lesson one: a tag that
+can be silently reused, combined with a cache that doesn't know it's stale, creates a gap
+between Git and reality just like an uncommitted manual change does.
 
-Full diagnosis trail: [03-debugging-playbook.md](03-debugging-playbook.md#a-pipeline-succeeded-but-the-pod-still-runs-the-old-broken-build),
-copy-paste fixes: [04-solutions-reference.md](04-solutions-reference.md#stale-image-served-from-cache-despite-a-successful-rebuild).
+## Lesson three: the full rebuild test finds bugs in the fix, not just in the original setup
 
-## The third lesson: the acid test finds bugs *in the fix*, not just in the original setup
+I ran the real test: delete the cluster, recreate it, bootstrap Flux, reload the
+encryption key, and watch everything come back. It worked, but not on the first attempt,
+and the failure was caused by a fix made earlier in the same session. Making a
+configuration file declarative through Nix turned it into a symlink pointing into the Nix
+store. `kind`'s node setup only mounts the specific folder it's told to, not the whole
+store path the symlink pointed to, so inside a fresh node the symlink target simply didn't
+exist. containerd found no configuration file, fell back to a default it shouldn't have
+used, and the app failed to pull its image on an otherwise correctly rebuilt cluster.
 
-Ran the real test — `kind delete cluster` → recreate from `~/kind-cluster.yaml` → `flux
-bootstrap` → re-provision the SOPS age key → watch everything come up. It worked, but not
-on the first try, and the failure was caused by a fix from *this same session*: making
-`registry-config`'s files declarative via home-manager turned them into symlinks into
-`/nix/store`. kind's `extraMounts` only bind-mounts the `registry-config` directory itself
-into each node container — it doesn't also expose `/nix/store`, so from inside a node's
-mount namespace the symlink target didn't exist. containerd silently found no `hosts.toml`
-and fell back to HTTPS, so `demo-app` went `ImagePullBackOff` with the exact
-"http: server gave HTTP response to HTTPS client" error from lesson two's playbook, on a
-completely fresh, otherwise-correct cluster.
+The fix was to also mount the Nix store itself into every node.
 
-Fix: also bind-mount `/nix/store` (read-only) into every node in `kind-cluster.yaml`.
+The lesson: making something declarative is a real change, not just paperwork that closes
+a checklist item. "It's committed to Git" and "it actually works on a from-scratch
+rebuild" are different claims, and only a full rebuild test tells them apart. It's worth
+rerunning that test after any change to the reproducibility setup, not just once at the
+end of a project.
 
-**The lesson:** making something declarative is itself a change that needs testing, not
-just a paperwork exercise that closes a gap. "Committed to Git" and "actually works on a
-from-scratch rebuild" are different claims — the acid test is what tells them apart, and
-it's worth re-running after *any* change to the reproducibility path, not just once at the
-end.
+## Lesson four: encrypting secrets closes one gap, but the encryption key itself can't be in Git
 
-## The fourth lesson: SOPS closes the secrets gap, but the age key itself is the one thing that can't be in Git
+Setting up SOPS with age was mechanical: generate a keypair, load the private key into the
+cluster as a Secret, add a config file telling SOPS what to encrypt, and tell Flux which
+of its reconciliation targets are allowed to decrypt. The one easy thing to miss: on a
+freshly rebuilt cluster, everything comes up fine except the parts that depend on
+encrypted secrets, which get stuck until the private key is manually reloaded. That's not
+a bug. The key deliberately isn't in Git, since putting it there would defeat the entire
+point of encrypting secrets with it. But it does mean "zero manual steps" comes with one
+honest exception: there will always be exactly one secret that has to come from outside
+Git, and it needs to be documented and backed up as carefully as anything else in the
+stack.
 
-Setting up SOPS + age was mechanical (generate keypair, load the private key as a cluster
-Secret, add `.sops.yaml`, encrypt, add `spec.decryption` to the relevant Flux
-Kustomizations) — the one genuinely easy-to-miss step is that the acid test's fresh cluster
-comes up with `flux-system`, `infrastructure`, and `tekton`/`flux-system` Kustomizations
-Ready, but **`apps` and `tekton-pipeline` stay stuck failing to decrypt** until the
-`sops-age` Secret is re-created from the *local* key file. That's not a bug — the age
-private key deliberately isn't in Git (that would defeat the point of encrypting secrets
-with it) — but it means "zero manual steps" for a from-scratch rebuild is one asterisk:
-there's always going to be exactly one out-of-band secret (the decryption key itself) that
-a human has to bring back. Document *where that key lives* as carefully as the rest of the
-stack, because losing it means every encrypted secret in Git becomes unrecoverable.
+A related note on rotating a credential that had been exposed: GitHub doesn't provide any
+way, API or otherwise, to create or delete a personal access token outside its web
+interface. The practical workaround was using the GitHub CLI's own device-code login flow
+to get a token tied to its OAuth app instead of a manually created one. That kind of token
+can be fully managed from the command line afterward, including revocation, which trades a
+little precision in scope for never needing to visit the tokens page again.
 
-**Related: rotating a leaked/exposed credential.** GitHub deliberately provides no
-API/CLI to create or delete a classic or fine-grained personal access token — that's
-web-UI-only, permanently. The practical workaround: use `gh auth refresh` (device-code
-flow) to mint a token tied to `gh`'s own OAuth app instead of a manually-created PAT. That
-token *can* be fully managed from the CLI going forward, including revocation
-(`gh auth logout` calls the API, not just clears local config) — so switching to it trades
-a small amount of scope precision for never needing the tokens web page again.
+## Lesson five: an app "running" and Kubernetes knowing it's healthy are different claims
 
-## The fifth lesson: "it runs" and "Kubernetes knows it's healthy" are different claims
+Both the app and the database had been running successfully this whole time with no
+liveness or readiness checks and no resource limits set. That's easy to miss, because
+nothing about it looks wrong. A pod with no health checks just shows as running forever,
+whether or not it's actually serving traffic, and a pod with no resource limits works
+fine right up until something else on the node needs memory or CPU it doesn't have.
+Kubernetes' ability to replace an unhealthy pod or protect a node from a runaway container
+is something you have to opt into per container. It isn't automatic.
 
-Both `demo-app` and `postgres` had run successfully for this entire build with **no
-liveness/readiness probes and no resource requests/limits**. That's easy to miss because
-nothing visibly breaks — a pod with no probes just shows `Running` forever, whether or not
-the process inside is actually serving traffic, and a pod with no resource limits just
-works fine right up until something on the node contends for memory/CPU and there's no
-guardrail. Kubernetes' entire self-healing value proposition (replace an unhealthy pod,
-protect nodes from noisy neighbors) is opt-in per container.
+Two specific things worth remembering:
 
-Two things worth remembering for next time:
-- **Plain Spring Boot has no health endpoint.** `spring-boot-starter-actuator` plus
-  `management.endpoint.health.probes.enabled=true` gets you `/actuator/health/liveness` and
-  `/actuator/health/readiness` for free — but it has to be added deliberately; it's not
-  implied by having a web app.
-- **A probe added at rollout time can cause a one-time restart that looks alarming but
-  isn't.** `postgres` restarted once right after the liveness probe was added — the probe's
-  `initialDelaySeconds` raced the container's first-ever `initdb`. Watch restart count over
-  a couple of minutes, not just the first reading, before concluding a probe is misconfigured.
+- Plain Spring Boot has no health endpoint by default. Adding the Actuator dependency and
+  one configuration flag gives you separate liveness and readiness endpoints for free, but
+  it has to be added on purpose.
+- Adding a health check to something that's already running can cause one restart that
+  looks alarming but usually isn't. The database restarted once right after its liveness
+  check was added, because the check's startup delay raced against the database's own
+  first-time initialization. Watch the restart count over a couple of minutes before
+  concluding a check is misconfigured.
 
-See [Deployment/Postgres in demo-app.yaml](https://github.com/b-kovacs/flux-infra/blob/main/clusters/kind/apps/demo-app.yaml)
-for the actual probe/resource values used.
+## Lesson six: two separate DNS systems exist in this cluster, and mixing them up nearly caused the wrong fix
 
-## The sixth lesson: two independent DNS mechanisms coexist in this cluster, and confusing them nearly caused a wrong fix
+While setting up automatic image updates, the component watching the image registry
+(running as a pod in a different namespace than everything else) couldn't resolve the
+registry's hostname, even though every other consumer of that same name resolved it fine.
+The instinctive fix, changing the registry's address to a fully qualified name, would have
+been wrong, and understanding why is the actual lesson.
 
-Setting up Flux image automation, `ImageRepository` (running as a pod in `flux-system`)
-couldn't resolve `registry-local`, even though every other consumer of that name — Tekton
-pods, the deployed app — resolved it fine. The instinctive fix (change the image name to
-the fully-qualified `registry-local.default.svc.cluster.local`) would have been **wrong**,
-and understanding why is the actual lesson:
+Regular pod-to-Service traffic resolves names through Kubernetes' own internal DNS, which
+only resolves a short, unqualified Service name for pods in that Service's own namespace.
+A pod in a different namespace needs the longer, qualified name.
 
-- **Pod-to-Service traffic** (Tekton's git-clone talking to the registry, `curl` from a
-  debug pod) resolves names via **Kubernetes CoreDNS**, which only resolves a bare
-  unqualified Service name for pods *in that Service's own namespace* — `default`, in this
-  case. A pod in `flux-system` needs the qualified name.
-- **Node-level image pulls** (containerd on a kind node, pulling `registry-local:5000/...`
-  for a Deployment) resolve names via **nerdctl's own bridge-network DNS** — the same
-  mechanism Docker/nerdctl uses to resolve sibling *container names* on a shared network.
-  This has nothing to do with CoreDNS at all; the node is a container on the `kind` network,
-  and `registry-local` is a sibling container name on that same network.
+Pulling a container image onto a node works completely differently. The node itself
+resolves the registry's name through the container runtime's own network, the same
+mechanism Docker or nerdctl uses to resolve one container's name to another on a shared
+network. That has nothing to do with Kubernetes' DNS at all.
 
-These two paths happen to both work today only because the k8s Service/EndpointSlice for
-`registry-local` was deliberately given the same IP as the actual container. Changing the
-*image reference itself* to the FQDN would have fixed the controller's scan but broken
-every node-level pull (nerdctl's network DNS doesn't know Kubernetes Service FQDNs).
-**The correct fix touches only the consumer that's actually broken**: a CoreDNS `rewrite`
-rule, scoped to queries coming from `flux-system` for `registry-local`, redirecting them to
-the qualified name — leaving the node/nerdctl path and every other pod's bare-name lookups
-completely untouched. See [04-solutions-reference.md](04-solutions-reference.md#a-service-that-only-resolves-from-its-own-namespace-cross-namespace-consumers)
-for the exact CoreDNS syntax that actually worked (it took three attempts — `ndots`-driven
-search-domain expansion and the trailing-dot absolute-name form both mattered).
+Both paths happened to work up to that point only because the Kubernetes Service pointing
+at the registry was manually set to the exact same address as the actual container.
+Changing the registry's name to the fully qualified version would have fixed the one
+broken consumer while breaking every node's ability to pull the image, since the
+container runtime's own DNS has no idea what a Kubernetes Service's full name means. The
+actual fix touched only the one thing that was broken: a small rewrite rule in Kubernetes'
+DNS server that redirects just the one namespace's queries for that name to the qualified
+version, leaving every other path untouched.
 
-## The seventh lesson: a fail-open helper script is a silent, unbounded-cost bug
+## Lesson seven: a script that fails silently and keeps going is worse than one that just fails
 
-The CI trigger `CronJob` (polls the app repo, creates a `PipelineRun` on a new commit) had
-two independent bugs — no git credentials for the private repo, and a missing RBAC `patch`
-verb — that individually would have just been visible failures. Combined, they were worse:
-`git ls-remote` failed silently into an empty string (masked by a `|| true` fallback meant
-for a *different* failure case — "state configmap doesn't exist yet"), an empty "latest
-commit" never equalled the stored one, so the script concluded "new commit" and triggered a
-build **every single 2-minute cycle, forever**, and the final "save state" step then also
-failed (RBAC), so nothing ever converged. It ran unnoticed for ~35 minutes before being
-caught by actually watching pipeline counts over time rather than checking the manifest for
-correctness.
+The job that checks for new commits and triggers a build had two separate bugs: no
+credentials for the private repository, and a missing permission needed to save its own
+state. Individually, either one would have just caused a visible failure. Together, they
+were worse. The command that checks the latest commit failed silently and returned
+nothing, a fallback meant for a completely different situation ("there's no saved state
+yet") quietly accepted that empty result, an empty value never matched the stored one, so
+the script concluded there was a new commit and triggered a build, every single cycle,
+forever. The final step that was supposed to save the new state also failed, because of
+the missing permission, so nothing ever settled. It ran unnoticed for about half an hour
+before it was caught, and it was caught by watching how many pipeline runs were piling up,
+not by reading the script and spotting the bug.
 
-**The general principle:** in automation that *takes an action* (not just reports), prefer
-failing loudly and doing nothing over silently defaulting to a value that makes the "act"
-branch look correct. `|| true` and `2>/dev/null` are fine for genuinely optional reads;
-they're a hazard on the one read whose failure should abort the whole run. The fix was
-explicit: check the critical value is non-empty and `exit 1` immediately if not, before any
-decision logic runs at all.
+The general point: in any automation that takes an action, not just one that reports
+something, it's better to fail loudly and do nothing than to silently fall back to a value
+that makes the "go ahead and act" branch look correct. Fallbacks that swallow errors are
+fine for genuinely optional reads. They're dangerous on the one read where a failure
+should stop the whole run. The fix was explicit: check that the value actually came back
+non-empty, and exit with an error immediately if it didn't, before any decision gets made.
 
-## The eighth lesson: "nothing broke" is not the same as "it's secure" — both containers had been running as root the whole time
+## Lesson eight: nothing breaking doesn't mean it's secure
 
-Neither `demo-app` nor `postgres` had ever had a `securityContext`. Both ran as `uid=0`
-from the very first successful deploy, through every subsequent rebuild, restart, and
-acid-test rebuild — completely invisible, because running as root doesn't *look* different
-from any other container in `kubectl get pods`, and nothing in this build's testing (probes,
-image rebuilds, the acid test) happens to check *who* a process runs as. It took a
-deliberate, specific check (`kubectl exec ... -- id`) to surface it.
+Neither the app nor the database had ever had a security context set. Both had been
+running as the root user since the very first successful deploy, through every rebuild
+and every full cluster rebuild after that, completely unnoticed, because running as root
+doesn't look any different in a pod listing, and nothing in the testing done up to that
+point happened to check who a process runs as. It took one specific command, checking the
+running user inside the container directly, to notice it at all.
 
-Fixing it wasn't free: Postgres's official image is normally trusted to start as root and
-drop its own privileges internally, but since it had *already been running as root* for
-real (its data directory was written to by root), forcing it to start as non-root directly
-needed a one-time `initContainer` (still root, just for this) to `chown` the existing volume
-before the main container could run as `999:999`. **The general shape:** a security
-property that "would have been free if set from day one" can require a real, careful
-migration step once real state already exists under the old assumption — check for this
-class of problem *before* accumulating state under insecure defaults, not after.
+Fixing it wasn't free. The official Postgres image is normally trusted to start as root
+and drop its own privileges. But because it had genuinely been running as root already,
+its data directory was owned by root, so switching it to run as a non-root user directly
+needed a one-time setup step (still running as root, just for that one step) to fix
+ownership of the existing files before the main container could run unprivileged.
 
-## The ninth lesson: before trusting a Kubernetes security feature, prove it's actually enforced here
+The general point: a security property that would have been free if it were set from day
+one can require a real, careful migration once real data already exists under the old
+assumption. It's worth checking for this kind of thing before state builds up under an
+insecure default, not after.
 
-Before writing any `NetworkPolicy`, the CNI in this cluster was checked empirically —
-deploy a deny-all policy in a throwaway namespace, confirm a test client actually gets
-blocked — rather than assumed from "Kubernetes supports NetworkPolicy." This mattered:
-`kindnet` (kind's default CNI) has, at various points in its history, not enforced
-NetworkPolicy at all, silently accepting the resource while doing nothing with it — the
-single most dangerous kind of "security" feature, one that looks configured and isn't.
-This kind version's `kindnet` does enforce it, confirmed by the test actually blocking
-traffic — but the lesson is the habit, not the specific result: **a security control that
-degrades to a no-op without any error is worse than not having it**, because it actively
-suggests a protection that isn't there. Test the mechanism before relying on it, every time,
-regardless of what the last cluster or the docs said.
+## Lesson nine: test a security control before trusting it
 
-## The tenth lesson: a ServiceMonitor's selector matches the Service's labels, not its selector — an easy, silent mix-up
+Before writing a real network policy (a Kubernetes firewall rule between pods), I first
+checked, in a throwaway namespace, whether the cluster's networking plugin actually
+enforces that kind of rule at all, rather than assuming it does because Kubernetes
+supports the feature in general. This mattered because some networking plugins have, at
+points in their history, silently accepted a network policy without enforcing it, which
+is arguably worse than having no policy, since it looks like protection that isn't
+actually there. This specific cluster's plugin does enforce it, confirmed by the test
+actually blocking traffic. But the habit matters more than that one result: a security
+control that quietly does nothing is worse than not having it, because it actively
+suggests a protection that isn't real. Test the mechanism before relying on it, every
+time, regardless of what worked on the last cluster or what the documentation claims.
 
-Wiring Prometheus up to scrape `demo-app` looked complete: `ServiceMonitor.spec.selector:
-matchLabels: {app: demo-app}`, a Service with `spec.selector: {app: demo-app}` routing to
-the right pods, a named port matching the `ServiceMonitor`'s endpoint. Nothing errored.
-Prometheus just never scraped it — the target didn't even appear as "down," it wasn't
-there at all in the normal target list.
+## Lesson ten: a monitoring rule matches a Service's labels, not its selector, and that's easy to get wrong
 
-The actual mechanism: a `ServiceMonitor` selects **Services by their own `metadata.labels`**
-(which Kubernetes copies onto the Service's Endpoints/EndpointSlice objects), completely
-independent of that Service's `spec.selector` (which only controls which *pods* it routes
-to). The `demo-app` Service had `spec.selector` set — routing worked fine for real traffic —
-but no `metadata.labels` of its own, so the `ServiceMonitor`'s `matchLabels: {app: demo-app}`
-never matched *the Service*, regardless of matching every pod perfectly.
+Setting up Prometheus to scrape the app looked complete: the rule telling it what to watch
+matched the right label, the Service routed to the right pods, the port name lined up.
+Nothing produced an error. Prometheus just never scraped it. The target didn't even show
+up as "down," it wasn't in the list at all.
 
-**Where it actually showed up:** not as an error, but in Prometheus's `/api/v1/targets`
-under `droppedTargets` rather than `activeTargets` — discovered via service discovery,
-then silently filtered out by a relabel rule checking
-`__meta_kubernetes_service_label_app` (empty) against `demo-app`. Found by reading
-Prometheus's own generated scrape config (`/api/v1/status/config`) line by line for the
-job in question, not by staring at the YAML — the YAML looked completely correct in
-isolation; the bug was in a cross-object assumption neither file states explicitly.
+The actual mechanism: the rule that tells Prometheus what to scrape matches a Service by
+its own labels, which get copied onto the Service's underlying network endpoints. That is
+completely separate from the selector that controls which pods the Service actually
+routes traffic to. The app's Service had a working selector, so real traffic routed fine,
+but it had no labels of its own, so the monitoring rule never matched the Service itself,
+even though it matched every pod perfectly.
 
-## The eleventh lesson: don't guess a fictional/future framework's API — go read the real, published artifact
+Where this actually showed up: not as an error, but buried in Prometheus's own list of
+discovered-but-filtered-out targets, dropped by an internal rule checking for a label that
+simply wasn't there. Found by reading Prometheus's own generated configuration for that
+specific job line by line, not by staring at the YAML files, which looked completely
+correct on their own. The bug lived in an assumption connecting two files, not in either
+file individually.
 
-Writing a `MockMvc`-based controller test failed to compile: `@WebMvcTest` and
-`com.fasterxml.jackson.databind.ObjectMapper` both "didn't exist." The tempting conclusion —
-"this project's renamed test starter must just not include the full web-testing stack" —
-was wrong, and abandoning the MockMvc test for a same-day plain-Mockito substitute was a
-worse fix than digging one level further. The actual, resolvable questions ("does this
-artifact carry this class, and at what package") don't require guessing even for an
-unfamiliar/relocated API — the real jars are sitting on Maven Central:
+## Lesson eleven: don't guess at an unfamiliar framework's API, go check the real package
+
+Writing a test using Spring's `MockMvc` failed to compile. Two specific things "didn't
+exist": the annotation that boots a web-layer test, and Jackson's JSON object mapper. The
+tempting conclusion was that this project's Spring Boot version, being recent, must simply
+not include full web-testing support, and settling for a plainer test without real HTTP
+behavior would have been the easy way out. That would have been the wrong call. Whether a
+given class exists, and where, isn't something you have to guess about even for an
+unfamiliar or recently changed API. The actual published artifacts are sitting on Maven
+Central and can be inspected directly:
 
 ```bash
 curl -s ".../spring-boot-starter-webmvc-test/4.1.1/spring-boot-starter-webmvc-test-4.1.1.pom" | grep artifactId
 curl -sL ".../spring-boot-webmvc-test/4.1.1/spring-boot-webmvc-test-4.1.1.jar" -o x.jar && unzip -l x.jar | grep WebMvcTest.class
 ```
 
-That found the real answer in minutes: `@WebMvcTest` had moved to
-`org.springframework.boot.webmvc.test.autoconfigure` (from
-`org.springframework.boot.test.autoconfigure.web.servlet`), and — the genuinely interesting
-find — **Jackson itself had relocated**, `com.fasterxml.jackson.databind` →
-`tools.jackson.databind` under groupId `tools.jackson.core`, which tracks Jackson's real,
-publicly-discussed plan for its 3.x line. `MockMvc`, `MockitoBean`,
-`MockMvcRequestBuilders`, and `MockMvcResultMatchers` were all exactly where 20 years of
-Spring muscle memory expects them — only the two things that actually moved needed
-updating. **The general shape:** "I can't find the right import" is a research task with a
-concrete, checkable answer (inspect the actual dependency's POM/jar), not a signal to
-downgrade the test's ambition.
+That found the real answer in a few minutes. The web-test annotation had simply moved to
+a new package in this Spring Boot version. And more interesting: Jackson itself had moved
+groups entirely, from its long-standing `com.fasterxml.jackson` package to `tools.jackson`,
+which matches Jackson's own publicly announced plan for its next major version. Everything
+else, `MockMvc` itself and the related test utilities, was exactly where twenty years of
+Spring convention would expect it. Only the two things that had actually moved needed
+updating. The general point: "I can't find the right import" is a question with a
+checkable answer. Go look at the dependency's actual contents. It isn't a sign to lower
+your ambitions for the test.
 
-## The twelfth lesson (corrected): don't let a plausible one-off theory become a documented fact — verify it, especially the theory that explains itself away
+## Lesson twelve: don't let a plausible one-off theory become a documented fact until it's actually checked, especially the one that seems to explain itself
 
-A build failed at the image-push step with `lstat ... target/demo-...jar: no such file or
-directory`, despite `maven-build`'s own logs showing that exact jar built seconds earlier in
-the same workspace. A retry succeeded. **The first write-up of this lesson concluded**
-`local-path-provisioner`'s node-local storage was the cause — a shared Tekton workspace
-only really shared if the scheduler happened to co-locate every Task on one node, which
-"nothing enforced." That was never actually verified against the failing run (its pods were
-already gone by the time it was investigated) — it was inferred from the retry succeeding
-on one node, which is exactly the "plausible conclusion, never checked against evidence"
-failure mode from the eleventh lesson, caught this time only because a real fix was
-attempted next.
+A build occasionally failed at the image-push step because it couldn't find a file the
+previous step had just built seconds earlier, in what was supposed to be the same shared
+workspace. Retrying the same build usually fixed it. My first explanation was that the
+shared storage backing that workspace wasn't reliably available across different nodes,
+and that the fix would need to force every step of a build onto the same node. I want to
+be upfront that this theory was never actually checked against the failing run itself
+(its pods were already gone by the time I looked), and it turned out to be wrong. I had
+inferred it from a retry succeeding, which is exactly the kind of unverified but
+plausible-sounding conclusion that lesson eleven warns about, and I only caught it this
+time because I went ahead and tried to build the actual fix.
 
-Building an explicit pod-affinity fix to force co-scheduling **immediately failed**, and
-the failure was the correction: Tekton already ships an **Affinity Assistant**
-(`coschedule: workspaces`, on by default in this install) built for exactly this problem —
-it creates a dedicated assistant pod first, then gives every Task pod sharing that
-workspace a *required* affinity to that specific pod (sidestepping the "first task has
-nothing to match yet" problem a naive fix hits). Confirmed live: an
-`affinity-assistant-<hash>` StatefulSet gets created per `PipelineRun`, and every Task pod
-carries a required `podAffinity` referencing it by its stable instance label — meaning
-co-scheduling was *already guaranteed*, correctly, the entire time. The original flake's
-real cause is still unknown; the node-mismatch theory that felt right is now known to be
-wrong. Left open, honestly, rather than replaced with a new unverified guess.
+Building that fix, forcing pods onto the same node, failed immediately, and the failure
+itself was the correction. The CI tool already has a built-in feature that guarantees
+exactly that kind of co-scheduling by design: it creates one dedicated helper pod first,
+then requires every step of a build to run on the same node as that helper. I confirmed
+this was already working correctly the whole time. At that point I still didn't know the
+real cause, and I want to be honest that I left it stated as unknown rather than
+inventing a new guess to replace the wrong one.
 
-**The general shape:** the moment a plausible diagnosis is about to become a documented
-lesson — not just a private hunch — is exactly the moment it deserves the most scrutiny,
-because a wrong lesson written down confidently is more damaging than an admitted unknown.
-Attempting the actual fix is often the fastest way to find out a diagnosis was wrong: the
-fix broke immediately, on contact with a mechanism that shouldn't have allowed the original
-symptom to happen at all.
+The actual cause, found afterward by finally comparing the start and end times of every
+failed build against every other build running at the same time: two builds were sharing
+one fixed storage volume with no protection against both writing to it at once. A later
+build's own cleanup step was deleting an earlier build's files while that earlier build
+was still running. This had been happening because the normal workflow during this
+project was to push a change and then immediately trigger a manual test build, which is
+exactly the condition that makes the automated trigger and a manual one collide.
 
-**Final update — the real cause, found by finally checking the thing that mattered:**
-correlating every failed build's start/completion timestamps against every *other*
-`PipelineRun`'s showed a perfect pattern — every single failure this project ever hit
-overlapped, within seconds, with a second `PipelineRun` also running. The confirming
-evidence was in the losing run's own logs the whole time: the later run's `git-clone`
-cleanup step (`cleandir()`) does `rm -rf .../pom.xml .../src .../target` on the *shared*
-`tekton-workspace` PVC — deleting the earlier run's files out from under it, mid-build, if
-both happen to be active at once. `tekton-workspace` is one fixed-name PVC reused by every
-run (kept deliberately, for the Maven `.m2` cache), with **zero mutual exclusion** between
-runs — the CronJob's own `concurrencyPolicy: Forbid` only prevents its *trigger-check* job
-from overlapping itself, not the actual `PipelineRun`s it creates from overlapping with each
-other or with a manually-triggered one. In practice, this fired constantly during this
-project specifically because pushing a commit and then immediately triggering a manual
-verification build — the normal workflow of this entire session — is exactly the condition
-that makes the CronJob's own auto-trigger and a manual trigger race each other.
+The fix was to have the automated trigger check whether a build is already in progress
+before starting a new one, and skip that cycle if so. That protects the automated path
+completely. It doesn't stop someone from manually starting a second build while one is
+already running, which is a real way to reproduce the original bug on demand, and is
+exactly how the fix itself got verified.
 
-Fixed by having the trigger check for any non-terminal `build-app` `PipelineRun` before
-creating a new one, skipping the cycle (the next poll picks the same commit back up) rather
-than racing a build already in flight. This protects the *automated* path completely; it
-does not (and isn't meant to) stop a human from manually triggering a second build while one
-is already running — that remained a real way to reproduce the bug on demand once the cause
-was known, and was used to verify the fix.
-
-Three theories, in order, each retired only once contradicted by direct evidence rather than
-by a better guess: node-locality (never checked, wrong) → "Tekton's Affinity Assistant
-already prevents that, so the cause is unknown" (correctly ruled out one theory, honestly
-declined to invent another) → the actual mechanism, found by finally checking run-to-run
-timing instead of re-theorizing about storage. The middle step — admitting "I don't know
-yet" instead of reaching for the next plausible-sounding story — is what kept the eventual
-answer from being a fourth wrong guess.
+Three theories, in order, each one dropped only because the evidence contradicted it, not
+because a better guess came along: a storage theory that was never checked and turned out
+wrong, then a correct realization that a built-in feature already prevented that exact
+problem (which meant admitting the real cause was still unknown, rather than replacing one
+guess with another), and finally the actual mechanism, found by checking the one thing
+that mattered the whole time: whether two builds were ever running at once. The middle
+step, saying "I don't know yet" instead of reaching for the next plausible story, is what
+kept the final answer from just being a fourth wrong guess.
