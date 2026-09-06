@@ -1,137 +1,162 @@
-# Architecture & Impact
+# Architecture and impact
 
-How the pieces fit together, why each layer exists, and what it's actually worth.
+How the pieces fit together, why each layer exists, and what it is actually worth.
 
 ## The layered architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Windows host  ──  WSL2  ──  Ultramarine Linux                    │
+│  Windows host -> WSL2 -> Ultramarine Linux                        │
 │                                                                   │
-│  ┌─ Declarative base (home-manager flake, install.sh) ─────────┐ │
-│  │   shell, git, gh, direnv, tooling, buildkit user service     │ │
-│  └──────────────────────────────────────────────────────────────┘ │
+│  Declarative base (home-manager flake, install.sh)                │
+│    shell, git, gh, direnv, tooling, buildkit user service          │
 │                                                                   │
-│  ┌─ Rootless container runtime ─────────────────────────────────┐ │
-│  │   containerd + nerdctl + buildkit  (systemd --user, no root)  │ │
-│  └──────────────────────────────────────────────────────────────┘ │
+│  Rootless container runtime                                       │
+│    containerd + nerdctl + buildkit (systemd --user, no root)       │
 │                                                                   │
-│  ┌─ Registries (standalone, persist across cluster recreation) ─┐ │
-│  │   pull-through caches (docker.io/quay/ghcr/k8s) + local push  │ │
-│  └──────────────────────────────────────────────────────────────┘ │
+│  Registries (standalone, persist across cluster recreation)       │
+│    pull-through caches (docker.io/quay/ghcr/k8s) + local push      │
 │                                                                   │
-│  ┌─ kind cluster (3 nodes) ─────────────────────────────────────┐ │
-│  │                                                               │ │
-│  │   Flux (GitOps CD) ── reconciles everything from flux-infra   │ │
-│  │     ├── infrastructure: MetalLB, Envoy Gateway (HelmReleases)  │ │
-│  │     ├── metallb-config (own layer, dependsOn infrastructure)  │ │
-│  │     ├── apps: demo-app + Postgres, Gateway/HTTPRoute          │ │
-│  │     ├── tekton + tekton-pipeline (CI, Flux-managed)           │ │
-│  │     └── observability + observability-config (kube-prometheus- │ │
-│  │         stack + demo-app ServiceMonitor, own layer/dependsOn)  │ │
-│  │                                                               │ │
-│  │   Tekton (CI) ── clone → maven(cached) → kaniko → local reg   │ │
-│  │     ▲ triggered by a CronJob polling the source repo           │ │
-│  │   Flux image automation ── registry → new tag → auto-commit   │ │
-│  │     └─► apps Kustomization redeploys automatically             │ │
-│  │                                                               │ │
-│  │   Workload: Spring Boot 4 + JPA  ──►  Postgres (PVC)          │ │
-│  └──────────────────────────────────────────────────────────────┘ │
+│  kind cluster (3 nodes)                                            │
+│                                                                   │
+│    Flux (GitOps CD), reconciles everything from flux-infra         │
+│      - infrastructure: MetalLB, Envoy Gateway (HelmReleases)       │
+│      - metallb-config (own layer, dependsOn infrastructure)        │
+│      - apps: demo-app + Postgres, Gateway/HTTPRoute                │
+│      - tekton + tekton-pipeline (CI, Flux-managed)                 │
+│      - observability + observability-config (kube-prometheus-      │
+│        stack + demo-app ServiceMonitor, own layer, dependsOn)      │
+│                                                                   │
+│    Tekton (CI): clone, then maven (cached), then kaniko, then      │
+│    push to the local registry. Triggered by a CronJob polling      │
+│    the source repo.                                                │
+│                                                                   │
+│    Flux image automation: watches the registry for a new tag,      │
+│    then auto-commits the Deployment update, and the apps           │
+│    Kustomization redeploys it automatically.                       │
+│                                                                   │
+│    Workload: Spring Boot 4 + JPA, talking to Postgres (PVC)        │
 └─────────────────────────────────────────────────────────────────┘
 
-Dev loop:  VS Code (Remote-WSL) + direnv devShell (JDK/Maven/Gradle)
+Dev loop: VS Code (Remote-WSL) with a direnv devShell providing JDK, Maven, and Gradle.
 ```
 
 ## Why each layer exists
 
 | Layer | Purpose | Why it matters |
 |---|---|---|
-| **home-manager flake** | Declarative user env | Reproducible base; `install.sh` rebuilds a machine. Nothing important is a forgotten manual step. |
-| **Rootless containerd/buildkit** | Run/build containers without Docker or root | Security (no root daemon) and a genuine understanding of the runtime. |
-| **Registries (cache + local)** | Fast pulls; a place to push built images | Cache survives cluster recreation → cold pulls happen once. Local registry = CI target with no cloud dependency. |
-| **kind (multi-node)** | Production-shaped local Kubernetes | Vanilla upstream, multi-node scheduling — real k8s behavior, disposable. |
-| **Flux (GitOps CD)** | Reconcile cluster ⇐ Git, continuously | Git is the source of truth; cluster self-heals to match; disaster recovery = `flux bootstrap`. |
-| **MetalLB / Envoy Gateway** | LoadBalancer IPs / Gateway API routing | The production networking shapes (even where WSL limits reachability). |
-| **PVCs** | Persistent storage | Data outlives pods — the storage/lifecycle-decoupling concept. |
-| **Tekton (CI, in-cluster)** | Build images from source, in the cluster | CI becomes "just more manifests"; Flux-managed → the CI system itself is reproducible. |
-| **kube-prometheus-stack** | Metrics, dashboards, alerting | The gap between "it's running" and "we can see what it's actually doing" — the difference operational excellence is made of. |
-| **Spring Boot + Postgres** | The actual workload | The thing all the infrastructure exists to run and deploy. |
+| home-manager flake | Declarative user environment | Reproducible base. `install.sh` rebuilds a whole machine, so nothing important is a step someone has to remember to do by hand. |
+| Rootless containerd and buildkit | Run and build containers without Docker or root | Better security, since there is no root daemon, and it forces a real understanding of how the container runtime actually works. |
+| Registries (cache and local) | Fast pulls, and a place to push built images | The cache survives a cluster recreation, so a slow pull from the real internet only ever happens once. The local registry is a CI target with no dependency on any cloud service. |
+| kind (multi-node) | A production-shaped local Kubernetes cluster | Vanilla upstream Kubernetes with real multi-node scheduling, so the behavior is genuine, while the cluster itself stays disposable. |
+| Flux (GitOps CD) | Continuously reconcile the cluster to match Git | Git is the source of truth. The cluster heals itself back to match Git on its own, and disaster recovery is just `flux bootstrap` again. |
+| MetalLB and Envoy Gateway | LoadBalancer IPs and Gateway API routing | The same networking shapes a real production cluster uses, even in places where WSL limits how reachable they actually are. |
+| PVCs | Persistent storage | Data outlives the pod that wrote it. This is the core idea behind decoupling storage from a workload's own lifecycle. |
+| Tekton (CI, running inside the cluster) | Build images from source, inside the cluster itself | CI becomes just more manifests. Because Flux manages Tekton too, the CI system is itself reproducible from Git. |
+| kube-prometheus-stack | Metrics, dashboards, and alerting | The gap between "it's running" and "I can actually see what it's doing" is exactly what operational maturity is made of. |
+| Spring Boot and Postgres | The actual workload | The thing all of the infrastructure above exists to build and deploy in the first place. |
 
-## Roles, clearly separated (a key mental model)
+## Roles, kept clearly separate
 
-These are **different layers, not competitors** — a common point of confusion:
+These are different layers with different jobs, not competing tools, which is a common
+point of confusion:
 
-- **Flux = CD / reconciliation** — "keep the cluster matching Git." Not a builder.
-- **Tekton = CI / pipelines** — "turn source into an artifact." Doesn't watch Git or reconcile.
-- **Event layer (Tekton Triggers / Argo Events) = the glue** — "when X happens, do Y." The
-  trigger, not the builder or reconciler.
-- **Crossplane** (not used here) — provisions *external cloud infra* as k8s resources; an
-  alternative to Terraform, **not** to Flux. Would compose *with* Flux, delivered via GitOps.
+Flux handles continuous delivery and reconciliation. Its whole job is "keep the cluster
+matching Git." It does not build anything itself.
 
-The full production CI/CD loop — **this is now built and verified end-to-end**, not just
-diagrammed (a `CronJob` stands in for the event layer, since a real webhook needs inbound
-reachability this WSL setup doesn't have):
+Tekton handles continuous integration, meaning pipelines that turn source code into a
+built artifact. It does not watch Git for changes on its own, and it does not reconcile
+anything.
+
+An event layer, something like Tekton Triggers or Argo Events, is the glue between the
+two: "when X happens, do Y." It is the trigger, not the builder and not the reconciler.
+This project uses a CronJob as a simple stand-in for that layer, explained below.
+
+Crossplane, which is not used in this project, provisions external cloud infrastructure
+as Kubernetes resources. It is an alternative to a tool like Terraform, not an
+alternative to Flux. In a real setup the two would work together, with Crossplane's
+resources still delivered through Flux the same way any other manifest is.
+
+The full CI/CD loop described below is built and verified end to end in this project, not
+just a diagram of an intended design. A CronJob stands in for the event layer here,
+because a real webhook needs GitHub to reach back into this machine, and this WSL setup
+has no way to accept that inbound connection:
 
 ```
-git push → [CronJob polls, pull-based] → Tekton builds unique-tagged image → registry
-                                                                                │
-                              Flux image automation detects the new tag ◄──────┘
-                                                                                │
-                             Flux auto-commits the Deployment update to Git ────┘ → Flux deploys
+git push -> a CronJob polls the repo (pull-based) -> Tekton builds an image with a
+unique tag -> the image is pushed to the registry -> Flux image automation notices the
+new tag -> Flux commits the Deployment update back to Git -> Flux deploys it
 ```
 
-## Impact — what this is worth
+## What this is actually worth
 
-**Reproducibility.** The end-state goal: a fresh machine → `install.sh` → `kind create` →
-`flux bootstrap` → the entire platform (infra, app, CI) rebuilds from Git. **This is no
-longer aspirational — it was run for real** (`kind delete cluster` → recreate → bootstrap →
-re-provision the SOPS key), and both `demo-app` and `postgres` came up from Git alone. That
-turns "my setup" from tribal knowledge into an artifact, with one honest asterisk: the SOPS
-decryption key itself can never live in Git, so a human always has to bring that one key
-back. See `06-open-gaps-and-next-steps.md` for what's left beyond reproducibility
-(observability, CI triggers, security hardening, reliability).
+**Reproducibility.** The end goal was: take a fresh machine, run `install.sh`, run
+`kind create`, run `flux bootstrap`, and have the entire platform (infrastructure, app,
+and CI) rebuild itself from Git alone. This is no longer just a goal. It was actually run
+for real: the cluster was deleted, recreated, bootstrapped again, and had its SOPS key
+reprovisioned, and both `demo-app` and `postgres` came back up from Git with no other
+manual steps. That turns "my personal setup" into something that is actually reproducible
+rather than tribal knowledge living only in one person's head, with one honest exception:
+the SOPS decryption key itself can never be stored in Git, since that would defeat the
+whole point of encrypting secrets, so a human always has to bring that one key back by
+hand. See `06-open-gaps-and-next-steps.md` for what is still missing beyond
+reproducibility itself.
 
-**Production-shaped learning.** Every concept here transfers directly to real clusters:
-GitOps, Helm, Gateway API, LoadBalancer, PVCs, in-cluster CI, image caching, dependency
-ordering, secret management. The WSL friction is environmental, not conceptual — the
-knowledge is portable to cloud/bare-metal where the networking "just works."
+**Production-shaped learning.** Every concept used here transfers directly to a real
+cluster: GitOps, Helm, the Gateway API, LoadBalancer services, persistent volumes,
+running CI inside the cluster, image caching, dependency ordering between layers, and
+secret management. The friction that shows up on WSL specifically is environmental, not
+a gap in the underlying concepts. The same knowledge applies unchanged on a real Linux
+box or a cloud cluster, where the networking limitations simply do not exist.
 
-**Security posture.** Rootless throughout; secrets are now SOPS-encrypted in Git (no
-plaintext credential in `flux-infra`); `demo-app` and `postgres` run as non-root with
-`allowPrivilegeEscalation: false` and all capabilities dropped; default-deny `NetworkPolicy`
-in `default` namespace with explicit allows (verified the CNI actually enforces this, not
-assumed); `automountServiceAccountToken: false` on both workloads. Still open: TLS on the
-Gateway, and the API-gateway features (rate limiting, auth) Envoy Gateway could provide via
-its `SecurityPolicy`/`BackendTrafficPolicy` CRDs but doesn't yet (see
-`06-open-gaps-and-next-steps.md`).
+**Security posture.** Everything here runs rootless. Secrets are SOPS-encrypted in Git,
+so there is no plaintext credential anywhere in `flux-infra`. Both `demo-app` and
+`postgres` run as non-root, with `allowPrivilegeEscalation` set to false and every Linux
+capability dropped. A default-deny `NetworkPolicy` sits in the `default` namespace with
+explicit allow rules layered on top of it, and that policy was actually tested against
+the cluster's real networking plugin rather than just assumed to work. Both workloads
+also have `automountServiceAccountToken` set to false, since neither one needs to talk to
+the Kubernetes API. What is still open: TLS on the Gateway, and the extra API-gateway
+features Envoy Gateway can provide through its own `SecurityPolicy` and
+`BackendTrafficPolicy` custom resources, like rate limiting and authentication, which
+are not configured yet. See `06-open-gaps-and-next-steps.md`.
 
-**Reliability.** `demo-app` runs 2 replicas behind a PodDisruptionBudget; `postgres` stays
-single-replica (no replication set up — this is a homelab, not HA) but has its own PDB
-(`maxUnavailable: 0`) protecting it from an accidental voluntary eviction, plus a daily
-`pg_dump` backup to a separate PVC. Still open: storage itself isn't redundant
-(`local-path`, single node) — genuinely hard to fix without a different storage layer
-(Longhorn, Rook/Ceph), out of scope for this pass. (An intermittent Tekton build flake was
-initially blamed on this same node-locality — Tekton's built-in Affinity Assistant actually
-already prevents that specific scenario structurally, so that diagnosis was retracted; see
-the twelfth lesson in `README.md`.)
+**Reliability.** `demo-app` runs two replicas behind a PodDisruptionBudget. `postgres`
+stays a single replica since this is a homelab setup with no real replication in place,
+but it still has its own PodDisruptionBudget with `maxUnavailable` set to zero, so it
+cannot be evicted by accident, plus a daily `pg_dump` backup written to a separate
+volume. What is still open: the underlying storage itself is not redundant, since it is
+backed by `local-path` on a single node, and fixing that properly would need a different
+storage layer entirely, like Longhorn or Rook and Ceph, which is out of scope for this
+pass. One thing worth calling out honestly here: an intermittent Tekton build failure was
+initially, and wrongly, blamed on this same kind of node-locality problem. Tekton's own
+built-in Affinity Assistant already prevents that specific scenario structurally, so that
+diagnosis was retracted once it was checked properly. The real cause is explained in the
+twelfth lesson in `README.md`.
 
-**Observability.** `kube-prometheus-stack` (Prometheus, Grafana, Alertmanager,
-node-exporter, kube-state-metrics) via Flux, in its own namespace/Kustomization layer;
-`demo-app` exposes real JVM/HTTP metrics via Micrometer, scraped every 15s. Caught a subtle,
-error-free bug getting there: a `ServiceMonitor` matches a Service's own `metadata.labels`,
-not its `spec.selector` — see the tenth lesson in `README.md`.
+**Observability.** `kube-prometheus-stack`, which bundles Prometheus, Grafana,
+Alertmanager, node-exporter, and kube-state-metrics, is installed through Flux in its own
+namespace and its own Kustomization layer. `demo-app` exposes real JVM and HTTP metrics
+through Micrometer, scraped every 15 seconds. Getting there caught a genuinely subtle
+bug with no error message anywhere: a `ServiceMonitor` matches a Service's own
+`metadata.labels`, not its `spec.selector`, which look similar but serve completely
+different purposes. See the tenth lesson in `README.md` for the full story.
 
-**Operational intuition.** The real payoff of the debugging: buildkit namespaces, cgroup
-delegation, inotify limits, CRD ordering, DNS scoping (kubelet vs pod), PVC constraints,
-socket-vs-TCP auth, cold-start timing. This is understanding that only comes from making
-each piece work when it fights you — and it's the difference between running commands and
-knowing *why*.
+**Operational intuition.** The real payoff of all this debugging is the set of things now
+understood from the inside rather than half-remembered from a tutorial: buildkit network
+namespaces, cgroup delegation, inotify limits, the order custom resource types have to be
+installed in, the difference between kubelet-level and pod-level DNS, PVC constraints,
+socket versus TCP authentication, and cold-start timing. That kind of understanding only
+comes from making each piece work while it actively resists you, and it is the difference
+between being able to run a command and actually knowing why that command is the right
+one.
 
 ## The honest boundary
 
-This platform is ideal for **learning and local development**. Its limits are all
-**environmental (WSL)**, not architectural: no inbound networking (webhooks need tunnels),
-LoadBalancer IPs unreachable from the host, clusters ephemeral across restarts. For
-anything requiring always-on availability or external reachability, the same architecture
-belongs on a real Linux VM or cloud cluster — where every pattern here works unchanged and
-the friction disappears.
+This platform is a strong fit for learning and local development. Its limits are
+environmental, caused by WSL, not architectural flaws in the design itself: there is no
+inbound networking, so webhooks would need a tunnel; LoadBalancer IPs are not reachable
+directly from the host; and clusters do not survive a restart on their own. For anything
+that needs to stay always on or be reachable from outside the machine, the exact same
+architecture belongs on a real Linux VM or a cloud cluster, where every pattern used here
+works unchanged and the friction described in this project simply disappears.
