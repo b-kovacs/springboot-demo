@@ -96,3 +96,5 @@ cluster (see that repo for the full path). To build the jar locally:
 ./mvnw clean package
 java -jar target/demo-0.0.1-SNAPSHOT.jar
 ```
+
+<!-- race-condition-fix verification commit -->
