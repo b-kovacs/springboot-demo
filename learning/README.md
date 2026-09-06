@@ -73,6 +73,9 @@ Two goals from the start:
   together, why each one exists, and what it's actually worth.
 - [`06-open-gaps-and-next-steps.md`](06-open-gaps-and-next-steps.md): what's still manual
   or uncommitted, and the plan to close it.
+- [`07-spring-boot-lessons.md`](07-spring-boot-lessons.md): the same kind of lessons,
+  focused specifically on the Java and Spring Boot side: testing strategy, mocks, CRUD
+  and API design, and how the app gets built and packaged.
 
 ## Lesson one: if it isn't committed to Git, it won't survive a fresh cluster
 
