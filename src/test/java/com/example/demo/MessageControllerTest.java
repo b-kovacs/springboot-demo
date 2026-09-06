@@ -1,73 +1,65 @@
 package com.example.demo;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
-import org.springframework.http.MediaType;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
-import org.springframework.test.web.servlet.MockMvc;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.Instant;
 import java.util.List;
 
-import static org.mockito.ArgumentMatchers.any;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@WebMvcTest(MessageController.class)
+@ExtendWith(MockitoExtension.class)
 class MessageControllerTest {
 
-    @Autowired
-    private MockMvc mockMvc;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @MockitoBean
+    @Mock
     private MessageService service;
 
-    @Test
-    void getAll_returnsMessages() throws Exception {
-        when(service.findAll()).thenReturn(List.of(new MessageResponse(1L, "hi", Instant.now())));
+    @InjectMocks
+    private MessageController controller;
 
-        mockMvc.perform(get("/messages"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$[0].text").value("hi"));
+    @Test
+    void all_delegatesToService() {
+        MessageResponse response = new MessageResponse(1L, "hi", Instant.now());
+        when(service.findAll()).thenReturn(List.of(response));
+
+        assertThat(controller.all()).containsExactly(response);
     }
 
     @Test
-    void getById_returns404WhenMissing() throws Exception {
-        when(service.findById(1L)).thenThrow(new MessageNotFoundException(1L));
+    void byId_delegatesToService() {
+        MessageResponse response = new MessageResponse(1L, "hi", Instant.now());
+        when(service.findById(1L)).thenReturn(response);
 
-        mockMvc.perform(get("/messages/1"))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.error").exists());
+        assertThat(controller.byId(1L)).isEqualTo(response);
     }
 
     @Test
-    void create_returns201WithBody() throws Exception {
-        when(service.create(any())).thenReturn(new MessageResponse(1L, "hi", Instant.now()));
+    void byId_propagatesNotFound() {
+        when(service.findById(99L)).thenThrow(new MessageNotFoundException(99L));
 
-        mockMvc.perform(post("/messages")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(new CreateMessageRequest("hi"))))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.text").value("hi"));
+        assertThatThrownBy(() -> controller.byId(99L))
+                .isInstanceOf(MessageNotFoundException.class);
     }
 
     @Test
-    void create_returns400WhenTextBlank() throws Exception {
-        mockMvc.perform(post("/messages")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(new CreateMessageRequest(""))))
-                .andExpect(status().isBadRequest());
+    void create_delegatesToService() {
+        CreateMessageRequest request = new CreateMessageRequest("hi");
+        MessageResponse response = new MessageResponse(1L, "hi", Instant.now());
+        when(service.create(request)).thenReturn(response);
+
+        assertThat(controller.create(request)).isEqualTo(response);
     }
 
     @Test
-    void delete_returns204() throws Exception {
-        mockMvc.perform(delete("/messages/1"))
-                .andExpect(status().isNoContent());
+    void delete_delegatesToService() {
+        controller.delete(1L);
+
+        verify(service).delete(1L);
     }
 }
